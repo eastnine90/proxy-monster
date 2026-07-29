@@ -14,6 +14,7 @@ import { Fragment, useMemo, useState } from 'react'
 import { useTranslations } from 'next-intl'
 import { useTheme } from 'next-themes'
 import CodeMirror from '@uiw/react-codemirror'
+import { EditorView } from '@codemirror/view'
 import { cedar, cedarCompletion, cedarLinter } from '@ridi/codemirror-lang-cedar'
 import { useCedarWasm } from '@/lib/cedar-wasm'
 import { CheckCircle2, Loader2, Pencil, Plus, ShieldCheck, Trash2 } from 'lucide-react'
@@ -397,6 +398,10 @@ function CedarPolicyDialog({
       editorTheme(resolvedTheme),
       lang,
       lang.language.data.of({ autocomplete: completion }),
+      // Wrap long policy lines (like sql-editor.tsx). Without this a long single-line
+      // policy sets the editor's min-content width, and DialogContent's grid track
+      // grows past the dialog card — the header/footer paint outside the modal.
+      EditorView.lineWrapping,
     ]
     // Live linting once the WASM has loaded — precise syntax error ranges, plus strict
     // schema type-validation (unknown action, wrong attribute) once the schema loads.
