@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ridi-oss/proxy-monster/goproxy/db"
+	"github.com/ridi-oss/proxy-monster/goproxy/engine"
 	"github.com/ridi-oss/proxy-monster/goproxy/internal/dbtest"
 	pb "github.com/ridi-oss/proxy-monster/goproxy/internal/pb"
 	"github.com/ridi-oss/proxy-monster/goproxy/spi"
@@ -36,6 +38,7 @@ func (mysqlTestOpener) OpenTarget(target spi.BackendTarget) (*sql.DB, error) {
 func (mysqlTestOpener) ProbeNamespace(conn *sql.Conn, targetDb string) ([]string, *int32, error) {
 	return ProbeMySQLNamespace(conn, targetDb)
 }
+func (mysqlTestOpener) NewDb() engine.Db { return db.MySqlDb{} }
 
 type pgTestOpener struct{}
 
@@ -45,6 +48,7 @@ func (pgTestOpener) OpenTarget(target spi.BackendTarget) (*sql.DB, error) {
 func (pgTestOpener) ProbeNamespace(conn *sql.Conn, targetDb string) ([]string, *int32, error) {
 	return ProbePostgresNamespace(conn, targetDb)
 }
+func (pgTestOpener) NewDb() engine.Db { return db.PgDb{} }
 
 // TestRunPinsOneConnectionOnDeadTarget is the regression test for the pinned-connection fix.
 // Introspection acquires ONE physical connection (db.Conn) for the whole refresh, so a dead or

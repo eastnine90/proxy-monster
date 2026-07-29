@@ -21,7 +21,7 @@ import (
 	// The named mysql import both registers the "mysql" driver (via init()) AND gives us mysql.Config
 	// for safe DSN construction, so no separate blank import is needed.
 	mysqldriver "github.com/go-sql-driver/mysql"
-	"github.com/ridi-oss/proxy-monster/analyzer/probe"
+	"github.com/ridi-oss/proxy-monster/goproxy/engine"
 	pb "github.com/ridi-oss/proxy-monster/goproxy/internal/pb"
 	"github.com/ridi-oss/proxy-monster/goproxy/spi"
 )
@@ -87,10 +87,13 @@ func OpenPostgresTarget(target spi.BackendTarget) (*sql.DB, error) {
 	return db, nil
 }
 
-// TargetOpener supplies the dialect-specific open + namespace-probe capabilities Run needs.
+// TargetOpener supplies the dialect-specific open + namespace-probe capabilities Run needs, plus the
+// dialect's engine.Db — whose NormalizeColumns is the one place that decides how a dialect folds
+// identifiers, so Run never branches on a dialect name to normalize.
 type TargetOpener interface {
 	OpenTarget(target spi.BackendTarget) (*sql.DB, error)
 	ProbeNamespace(conn *sql.Conn, targetDb string) (defaultSchemas []string, mysqlLowerCaseTableNames *int32, err error)
+	NewDb() engine.Db
 }
 
 // Run introspects the target's information_schema over a live connection and returns the catalog to
@@ -134,16 +137,16 @@ func Run(opener TargetOpener, target spi.BackendTarget) (*pb.CatalogRequest, err
 	// (catalog storage, browse_catalog, Cedar Table::/Column:: EUIDs, column_classification, the
 	// per-connection schema-fragment pool normalized the same way in goproxy/db) ever sees raw
 	// introspected spelling; no caller decides whether/how to fold.
-	// Only the MySQL namespace probe sets mysqlLowerCaseTableNames (the Postgres probe returns nil), so it
-	// both selects the dialect and carries the fold mode: Postgres normalizes as identity, MySQL folds.
-	dialect := "postgres"
+	// The dialect's own engine.Db owns the fold, so this call site names no dialect. Only the MySQL
+	// namespace probe sets mysqlLowerCaseTableNames (the Postgres probe returns nil), and it carries the
+	// fold mode MySQL's NormalizeColumns is gated by; Postgres ignores the argument.
 	lctnMode := 0
 	if mysqlLowerCaseTableNames != nil {
-		dialect = "mysql"
 		lctnMode = int(*mysqlLowerCaseTableNames)
 	}
-	columns = normalizeColumns(dialect, lctnMode, columns)
-	defaultSchemas = normalizeSchemas(dialect, lctnMode, defaultSchemas)
+	dbImpl := opener.NewDb()
+	columns = dbImpl.NormalizeColumns(lctnMode, columns)
+	defaultSchemas = normalizeSchemas(dbImpl, lctnMode, defaultSchemas)
 
 	distinctTables := map[string]struct{}{}
 	for _, c := range columns {
@@ -164,27 +167,19 @@ func Run(opener TargetOpener, target spi.BackendTarget) (*pb.CatalogRequest, err
 	}, nil
 }
 
-// normalizeColumns folds each column's schema/table/column to its canonical spelling.
-func normalizeColumns(dialect string, lctnMode int, columns []*pb.Column) []*pb.Column {
-	out := make([]*pb.Column, len(columns))
-	for i, c := range columns {
-		schemaName, table, column := probe.NormalizeRelation(dialect, lctnMode, c.GetSchema(), c.GetTable(), c.GetColumn())
-		out[i] = &pb.Column{
-			Schema: schemaName, Table: table, Column: column,
-			DataType: c.GetDataType(), Ordinal: c.GetOrdinal(), Nullable: c.GetNullable(),
-		}
-	}
-	return out
-}
-
 // normalizeSchemas folds each bare schema name (default_schemas / search_path entries have no
-// associated table) via NormalizeRelation with placeholder table/column values, discarding those parts —
-// the fold decision is schema-name-only (verified empirically: stable regardless of the table argument).
-func normalizeSchemas(dialect string, lctnMode int, schemas []string) []string {
-	out := make([]string, len(schemas))
+// associated table) through the dialect's own NormalizeColumns with placeholder table/column values,
+// discarding those parts — the fold decision is schema-name-only (verified empirically: stable
+// regardless of the table argument). One call folds the whole list, so a dialect that memoizes
+// per-(schema, table) work does it once here too.
+func normalizeSchemas(dbImpl engine.Db, lctnMode int, schemas []string) []string {
+	placeholders := make([]*pb.Column, len(schemas))
 	for i, s := range schemas {
-		schemaName, _, _ := probe.NormalizeRelation(dialect, lctnMode, s, "_", "_")
-		out[i] = schemaName
+		placeholders[i] = &pb.Column{Schema: s, Table: "_", Column: "_"}
+	}
+	out := make([]string, len(schemas))
+	for i, c := range dbImpl.NormalizeColumns(lctnMode, placeholders) {
+		out[i] = c.GetSchema()
 	}
 	return out
 }

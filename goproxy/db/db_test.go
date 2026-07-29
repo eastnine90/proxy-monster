@@ -110,6 +110,31 @@ func TestMySqlNormalizeColumns(t *testing.T) {
 	if out0[0].GetSchema() != "AppDB" || out0[0].GetTable() != "UserRows" || out0[0].GetColumn() != "customerid" {
 		t.Errorf("mode 0: got %s.%s.%s, want AppDB.UserRows.customerid", out0[0].GetSchema(), out0[0].GetTable(), out0[0].GetColumn())
 	}
+
+	// A multi-row fragment with a repeated (schema, table) exercises the batched path (one sqlglot
+	// parse per distinct table, memoized; column folded per row). Row order and each row's non-identity
+	// fields must be preserved.
+	multi := []*pb.Column{
+		{Schema: "AppDB", Table: "UserRows", Column: "CustomerID", DataType: "int", Ordinal: 1, Nullable: false},
+		{Schema: "AppDB", Table: "UserRows", Column: "EmailAddr", DataType: "varchar", Ordinal: 2, Nullable: true},
+		{Schema: "AppDB", Table: "OrderRows", Column: "OrderID", DataType: "bigint", Ordinal: 1, Nullable: false},
+	}
+	outMulti := (MySqlDb{}).NormalizeColumns(1, multi)
+	if len(outMulti) != 3 {
+		t.Fatalf("NormalizeColumns returned %d columns, want 3", len(outMulti))
+	}
+	wantSchema := []string{"appdb", "appdb", "appdb"}
+	wantTable := []string{"userrows", "userrows", "orderrows"}
+	wantColumn := []string{"customerid", "emailaddr", "orderid"}
+	for i, c := range outMulti {
+		if c.GetSchema() != wantSchema[i] || c.GetTable() != wantTable[i] || c.GetColumn() != wantColumn[i] {
+			t.Errorf("mode 1 row %d: got %s.%s.%s, want %s.%s.%s",
+				i, c.GetSchema(), c.GetTable(), c.GetColumn(), wantSchema[i], wantTable[i], wantColumn[i])
+		}
+		if c.GetDataType() != multi[i].GetDataType() || c.GetOrdinal() != multi[i].GetOrdinal() || c.GetNullable() != multi[i].GetNullable() {
+			t.Errorf("mode 1 row %d: non-identity fields not preserved: got %+v, want fields from %+v", i, c, multi[i])
+		}
+	}
 }
 
 func TestPgNormalizeColumnsIsIdentity(t *testing.T) {

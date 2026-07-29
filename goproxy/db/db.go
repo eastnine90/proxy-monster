@@ -31,12 +31,24 @@ func (MySqlDb) LowerCaseTableNamesProbeSQL() string { return "SELECT @@lower_cas
 // NormalizeColumns folds each column to analyzer/probe's canonical MySQL spelling — the SAME
 // normalization introspect's bulk catalog push uses, so the schema-fragment pool this feeds
 // (goproxy/engine.Refetcher) and the persisted catalog never disagree on spelling.
+//
+// Folds through probe.NormalizeMySQLColumns, which memoizes the per-(schema, table) identifier parse.
+// A schema fragment repeats one schema and each table name once per column, so the per-row path
+// re-parsed the same two identifiers thousands of times: ~13s of CPU on a 4,390-column schema, enough
+// to push a catalog refetch past the control plane's run-open deadline and fail every query on the
+// datasource. The batched fold is O(distinct tables) parses instead of O(columns).
 func (MySqlDb) NormalizeColumns(lowerCaseTableNames int, columns []*pb.Column) []*pb.Column {
+	schemas := make([]string, len(columns))
+	tables := make([]string, len(columns))
+	names := make([]string, len(columns))
+	for i, c := range columns {
+		schemas[i], tables[i], names[i] = c.GetSchema(), c.GetTable(), c.GetColumn()
+	}
+	outSchemas, outTables, outColumns := probe.NormalizeMySQLColumns(lowerCaseTableNames, schemas, tables, names)
 	out := make([]*pb.Column, len(columns))
 	for i, c := range columns {
-		schemaName, table, column := probe.NormalizeRelation("mysql", lowerCaseTableNames, c.GetSchema(), c.GetTable(), c.GetColumn())
 		out[i] = &pb.Column{
-			Schema: schemaName, Table: table, Column: column,
+			Schema: outSchemas[i], Table: outTables[i], Column: outColumns[i],
 			DataType: c.GetDataType(), Ordinal: c.GetOrdinal(), Nullable: c.GetNullable(),
 		}
 	}

@@ -150,6 +150,39 @@ func CanonicalMySQLRelation(mysqlLowerCaseTableNames int, schemaName, table, col
 	return schemaID.Name(), tableID.Name(), d.FoldIdentifierName(column, false)
 }
 
+// NormalizeMySQLColumns folds a batch of column identities to their canonical spelling, memoizing the
+// per-(schema, table) work. Semantically identical to calling CanonicalMySQLRelation for each row, but
+// O(distinct tables) sqlglot parses instead of O(columns): within a schema fragment the schema is
+// constant and each table's columns repeat its name, so re-parsing schema+table per column (as the
+// per-row path does) is pure waste — the dominant cost on a wide schema. Column names still fold
+// per row (a cheap name fold, no identifier parse). schemas/tables/columns are parallel, equal-length.
+func NormalizeMySQLColumns(mysqlLowerCaseTableNames int, schemas, tables, columns []string) (outSchemas, outTables, outColumns []string) {
+	n := len(columns)
+	outSchemas = make([]string, n)
+	outTables = make([]string, n)
+	outColumns = make([]string, n)
+	d := mysqlNormalizationDialect(mysqlLowerCaseTableNames)
+	type rel struct{ schema, table string }
+	cache := make(map[rel][2]string)
+	for i := 0; i < n; i++ {
+		key := rel{schemas[i], tables[i]}
+		canon, ok := cache[key]
+		if !ok {
+			schemaID := exp.ParseIdentifier(key.schema, d)
+			tableID := exp.ParseIdentifier(key.table, d)
+			exp.Table(exp.Args{"this": tableID, "schema": schemaID})
+			d.NormalizeIdentifier(schemaID)
+			d.NormalizeIdentifier(tableID)
+			canon = [2]string{schemaID.Name(), tableID.Name()}
+			cache[key] = canon
+		}
+		outSchemas[i] = canon[0]
+		outTables[i] = canon[1]
+		outColumns[i] = d.FoldIdentifierName(columns[i], false)
+	}
+	return outSchemas, outTables, outColumns
+}
+
 // NormalizeRelation resolves schemaName/table/column's canonical spelling for dialect — the single
 // source of truth every direct Go-to-Go caller shares (goproxy calls this in-process: introspect's
 // bulk catalog push and the schema-fragment refetch path both go through it), so no caller ever
