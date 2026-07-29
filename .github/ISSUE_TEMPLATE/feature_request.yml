@@ -1,0 +1,106 @@
+name: Feature request
+description:
+  Propose a capability, a broader SQL surface, or a change to the model
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Planned and deferred work already lives in
+        [docs/backlog.md](https://github.com/ridi-oss/proxy-monster/blob/main/docs/backlog.md),
+        and the gaps we knowingly carry are in
+        [KNOWN_LIMITATIONS.md](https://github.com/ridi-oss/proxy-monster/blob/main/KNOWN_LIMITATIONS.md).
+        Read both before filing — a "missing" feature is often a deliberate,
+        documented over-deny.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - "goproxy — the wire proxy (data plane)"
+        - "control-plane — decisions, policy, catalog, admin API"
+        - "analyzer — SQL lineage and required grants"
+        - "web — the console"
+        - "pmon — the client broker daemon"
+        - "auditmon — the audit-trail monitor"
+        - "Deployment, build, or docs"
+        - "Cross-cutting"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      description: >-
+        MySQL is the primary target and leads; PostgreSQL is experimental.
+      options:
+        - MySQL
+        - PostgreSQL
+        - Both
+        - Not engine-specific
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: >-
+        What you are trying to do and where proxy-monster stops you. Concretely
+        — the statement that is denied, the policy you cannot express, the
+        workflow you cannot complete.
+      placeholder: |
+        `analyst` needs aggregate revenue per region, but every statement touching
+        `orders.customer_email` denies even though the column never reaches the
+        output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: >-
+        What you would like to happen. Name the decision a statement should
+        reach (ALLOW, MASK, or DENY) and for which roles, if that is the point
+        of the request.
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Effect on enforcement
+      description: >-
+        proxy-monster is fail-closed — anything it cannot prove safe is denied,
+        and coverage gaps are treated as security gaps. If this would let a
+        statement through that is denied today, say what makes it provably safe
+        — what the lineage analyzer would have to establish, and what a masked
+        column is still guaranteed. Answer "none" for a change that cannot widen
+        access.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >-
+        Workarounds you tried — a different policy shape, a JIT elevation grant,
+        the query-approval workflow — and why they fall short.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before filing
+      options:
+        - label: >-
+            I checked
+            [docs/backlog.md](https://github.com/ridi-oss/proxy-monster/blob/main/docs/backlog.md)
+            and
+            [KNOWN_LIMITATIONS.md](https://github.com/ridi-oss/proxy-monster/blob/main/KNOWN_LIMITATIONS.md);
+            this is not already tracked.
+          required: true

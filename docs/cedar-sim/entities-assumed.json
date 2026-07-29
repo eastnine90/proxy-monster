@@ -1,0 +1,14 @@
+[
+  { "uid": { "type": "Role", "id": "pii-reader" }, "attrs": {}, "parents": [] },
+  { "uid": { "type": "Tag", "id": "pii" }, "attrs": {}, "parents": [] },
+  {
+    "uid": { "type": "Column", "id": "users.rrn" },
+    "attrs": {},
+    "parents": [{ "type": "Tag", "id": "pii" }]
+  },
+  {
+    "uid": { "type": "User", "id": "requester" },
+    "attrs": {},
+    "parents": [{ "type": "Role", "id": "pii-reader" }]
+  }
+]

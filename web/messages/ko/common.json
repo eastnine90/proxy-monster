@@ -1,0 +1,22 @@
+{
+  "appName": "proxy-monster",
+  "locale": {
+    "en": "EN",
+    "ko": "KO",
+    "switchTo": "{locale}로 전환"
+  },
+  "signOut": "로그아웃",
+  "noRoles": "역할 없음",
+  "save": "저장",
+  "cancel": "취소",
+  "delete": "삭제",
+  "edit": "수정",
+  "create": "생성",
+  "loading": "불러오는 중…",
+  "confirm": "확인",
+  "close": "닫기",
+  "toggleTheme": "테마 전환",
+  "unableToVerifyAdmin": "관리자 권한을 확인할 수 없습니다. 관리자 콘텐츠를 사용할 수 없습니다.",
+  "notAuthorized": "권한이 없습니다",
+  "adminRequired": "이 영역을 보려면 관리자 권한이 필요합니다."
+}

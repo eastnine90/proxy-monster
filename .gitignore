@@ -1,0 +1,54 @@
+# Gradle
+.gradle/
+build/
+**/build/
+# Per-leg build trees from `mise run test-db-matrix-parallel` (-Ppm.buildDir)
+.gradle-matrix/
+
+# Kotlin / JVM
+*.class
+hs_err_pid*
+replay_pid*
+
+# Keep the Gradle wrapper jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# IntelliJ / IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env / secrets — never commit
+.env
+*.local
+secrets/
+*.pem
+*.key
+*.crt
+
+# Local scratch. Ignored in the repo rather than only in a personal ~/.gitignore.global, so a
+# contributor's throwaway notes cannot be committed by a `git add -A` — these files tend to carry
+# real hostnames, credentials, and internal schema names.
+tmp/
+
+# Parity oracle (analyzer/probe): the pinned Python sqlglot checkout the Go parity test compares
+# against, provisioned locally on demand — absent = the parity test skips (golden.json is the frozen
+# regression guard). Plus any bytecode its driver emits.
+.reference/
+__pycache__/
+*.pyc
+
+# Go workspace checksums. The root go.work is committed (it makes root-relative Go commands work),
+# but go.work.sum is not: each module's own go.sum carries the hashes the build verifies, and this
+# file is a rebuildable superset that grows on any `go mod download` — churn with no added guarantee.
+go.work.sum
+
+# Kotlin incremental-compiler session artifacts (ephemeral build state)
+.kotlin/

@@ -1,0 +1,45 @@
+# Shared build context (repo root) for control-plane/Dockerfile (JVM: needs engine, analyzer/jvm, and
+# every module's build.gradle.kts for Gradle's configuration phase) and goproxy/Dockerfile (Go: copies
+# goproxy/ + the sibling mysqlwire/ module it resolves via a replace directive). Excludes what neither
+# build needs.
+
+# Neither build needs these
+web/
+pmon/
+
+# VCS / editor / OS
+.git/
+.claude/
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Build outputs / caches (rebuilt fresh in the image; never copy host artifacts in)
+.gradle/
+.kotlin/
+**/build/
+out/
+
+# Local-dev side-channel state (never present in a clean checkout)
+.reference/
+__pycache__/
+*.pyc
+
+# Go workspace files. Each Dockerfile copies the modules it needs and builds inside one of them, so a
+# workspace in the context would only pull the build into workspace mode over modules that aren't there.
+go.work
+go.work.sum
+
+# Docs — not needed to build, keep the context small
+*.md
+docs/
+pmon/launchd/*.plist
+
+# Local secrets — must never end up baked into an image layer
+.env
+*.local
+secrets/
+*.pem
+*.key
+*.crt

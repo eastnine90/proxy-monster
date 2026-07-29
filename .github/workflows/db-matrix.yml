@@ -1,0 +1,194 @@
+name: DB version matrix
+
+# proxy-monster claims support for a set of database versions: MySQL 8.0/8.4 and PostgreSQL 16/17 as
+# query targets, PostgreSQL 16/17 as the control-plane's own store. This workflow runs the DB-backed
+# tests against every one of them, one version per leg so the legs run in parallel.
+#
+# The version set is NOT written here. A setup job reads `db-support.json` and emits the matrix, so
+# adding a version is a one-line edit to that file and the legs follow. DbSupportMatrixTest fails the
+# build if that file and the engine's bundled classification manifests disagree, which closes the other
+# direction: a version cannot be tested without also being declared and curated.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: resolve supported versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      jvm: ${{ steps.build.outputs.jvm }}
+      goproxy: ${{ steps.build.outputs.goproxy }}
+      auditmon: ${{ steps.build.outputs.auditmon }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the matrix from db-support.json
+        id: build
+        run: |
+          set -euo pipefail
+
+          # The control-plane suite uses one PostgreSQL container as BOTH its own store and a
+          # PostgreSQL query target, and one MySQL container as a MySQL target. So its legs are the
+          # cross product of the PostgreSQL and MySQL versions: every leg exercises a supported store
+          # and the union across legs covers every supported target. Same shape for goproxy.
+          #
+          # An empty cross product would silently produce zero legs, and a workflow with no legs
+          # reports success — the exact "misconfig laundered into a pass" shape. Assert non-empty.
+          jvm=$(jq -ce '
+            [ .storage[]  | select(.engine == "postgres") | .image ] as $pg
+            | [ .target[] | select(.engine == "mysql")    | .image ] as $my
+            | [ $pg[] as $p | $my[] as $m | {pg: $p, mysql: $m} ]
+          ' db-support.json)
+
+          # goproxy proxies TO databases, so its PostgreSQL axis is the target set, not the store set.
+          gop=$(jq -ce '
+            [ .target[] | select(.engine == "postgres") | .image ] as $pg
+            | [ .target[] | select(.engine == "mysql")  | .image ] as $my
+            | [ $pg[] as $p | $my[] as $m | {pg: $p, mysql: $m} ]
+          ' db-support.json)
+
+          # auditmon reads the control-plane's own store, so it follows the store set.
+          am=$(jq -ce '[ .storage[] | select(.engine == "postgres") | {pg: .image} ]' db-support.json)
+
+          for name in jvm gop am; do
+            eval "value=\$$name"
+            if [ "$(jq -r 'length' <<<"$value")" -eq 0 ]; then
+              echo "::error::db-support.json produced an EMPTY $name matrix; no version would be tested." >&2
+              exit 1
+            fi
+          done
+
+          echo "jvm=$jvm" >>"$GITHUB_OUTPUT"
+          echo "goproxy=$gop" >>"$GITHUB_OUTPUT"
+          echo "auditmon=$am" >>"$GITHUB_OUTPUT"
+          echo "Resolved legs:"
+          jq -r '.[] | "  control-plane: \(.)"' <<<"$jvm"
+          jq -r '.[] | "  goproxy: \(.)"' <<<"$gop"
+          jq -r '.[] | "  auditmon: \(.)"' <<<"$am"
+
+  control-plane:
+    name: control-plane ${{ matrix.pg }} + ${{ matrix.mysql }}
+    needs: matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      # One version's failure is a fact about that version; the other legs still need to report, so a
+      # red leg must not cancel its siblings.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.jvm) }}
+    env:
+      PM_TEST_POSTGRES_IMAGE: ${{ matrix.pg }}
+      PM_TEST_MYSQL_IMAGE: ${{ matrix.mysql }}
+      # Without Docker, Testcontainers tests SKIP and the suite still reports success — a pass for a
+      # version nothing ran. On CI, missing Docker is a hard failure.
+      PM_REQUIRE_DB_TESTS: "true"
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installs java/gradle/go/node/pnpm from mise.toml, so versions are never restated here. Go is
+      # needed for the JVM leg too: :analyzer:jvm's processResources shells out to
+      # `go build -buildmode=c-shared`.
+      - uses: jdx/mise-action@v4
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      # --no-build-cache: Gradle's Test task is cacheable and setup-gradle restores the build cache, so
+      # without this a leg could satisfy :control-plane:test from a cache entry and report a pass for a
+      # version whose containers never started. The task's declared inputs include the image env vars, so
+      # a cache hit across legs is unlikely — but "unlikely" is not the property this workflow exists to
+      # guarantee.
+      - name: Test
+        run: ./gradlew --no-daemon --no-build-cache :control-plane:test
+
+      # The report names which versions the leg ran, so a green check can be traced to a version
+      # rather than taken on trust. An artifact name may not contain a colon, and expressions have no
+      # string-replace function, so the safe name is computed in a step.
+      - name: Name this leg
+        id: leg
+        run: |
+          set -euo pipefail
+          echo "slug=$(printf '%s__%s' "$PG" "$MYSQL" | tr ':/' '--')" >>"$GITHUB_OUTPUT"
+        env:
+          PG: ${{ matrix.pg }}
+          MYSQL: ${{ matrix.mysql }}
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: control-plane-${{ steps.leg.outputs.slug }}
+          path: control-plane/build/reports/tests/test
+
+  goproxy:
+    name: goproxy ${{ matrix.pg }} + ${{ matrix.mysql }}
+    needs: matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.goproxy) }}
+    env:
+      PM_TEST_POSTGRES_IMAGE: ${{ matrix.pg }}
+      PM_TEST_MYSQL_IMAGE: ${{ matrix.mysql }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      # goproxy's dbtest helpers t.Fatal without Docker rather than skipping, so no opt-in flag is
+      # needed here to make a Docker-less run fail.
+      - name: Test
+        working-directory: goproxy
+        run: go test ./...
+
+  auditmon:
+    name: auditmon ${{ matrix.pg }}
+    needs: matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.auditmon) }}
+    env:
+      PM_TEST_POSTGRES_IMAGE: ${{ matrix.pg }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: Test
+        working-directory: auditmon
+        run: go test ./...
+
+  # A single required check that is green only when every leg is. Without it, a branch protection rule
+  # would have to name each matrix leg, and adding a version to db-support.json would silently create
+  # an unprotected leg.
+  matrix-complete:
+    name: all DB versions pass
+    needs: [control-plane, goproxy, auditmon]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check every leg
+        run: |
+          set -euo pipefail
+          results="${{ needs.control-plane.result }} ${{ needs.goproxy.result }} ${{ needs.auditmon.result }}"
+          echo "leg results: $results"
+          for r in $results; do
+            # Anything other than success — including 'skipped', which is what a cancelled or
+            # never-started leg reports — has to fail this gate rather than pass by omission.
+            if [ "$r" != "success" ]; then
+              echo "::error::a DB version leg did not succeed (got: $results)" >&2
+              exit 1
+            fi
+          done

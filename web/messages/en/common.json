@@ -1,0 +1,22 @@
+{
+  "appName": "proxy-monster",
+  "locale": {
+    "en": "EN",
+    "ko": "KO",
+    "switchTo": "Switch to {locale}"
+  },
+  "signOut": "Sign out",
+  "noRoles": "no roles",
+  "save": "Save",
+  "cancel": "Cancel",
+  "delete": "Delete",
+  "edit": "Edit",
+  "create": "Create",
+  "loading": "Loading…",
+  "confirm": "Confirm",
+  "close": "Close",
+  "toggleTheme": "Toggle theme",
+  "unableToVerifyAdmin": "Unable to verify administrator permissions. Admin content is unavailable.",
+  "notAuthorized": "Not authorized",
+  "adminRequired": "Administrator permissions are required to view this area."
+}

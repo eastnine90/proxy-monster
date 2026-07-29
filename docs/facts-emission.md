@@ -1,0 +1,295 @@
+# Facts emission — resources, function output, and capability gates
+
+The analyzer states facts; Cedar sets policy. For every statement the Go
+analyzer emits one complete set of authorization facts — the columns read or
+written, every physical table scanned, named function calls the parser can
+classify, classified utility commands, required datasource actions, and whether
+the statement is resolved. The control-plane enriches those resource identities
+with catalog, user, and shipped `system:` tags, assembles Cedar entity graphs,
+and makes every policy decision there. A missing required fact is a security
+bug.
+
+This doc defines the facts and the Cedar resource semantics over them. The wire
+contract that carries the facts and the rule that Kotlin never parses or
+classifies SQL live in
+[statement-facts-contract.md](./statement-facts-contract.md). Which objects
+receive shipped tags lives in
+[system-classification.md](./system-classification.md); the Cedar RBAC spine and
+the shipped policies live in [authz-model.md](./authz-model.md) and
+[policy-store.md](./policy-store.md).
+
+## The facts
+
+For each statement the analyzer emits, in `StatementFacts`
+(`proto/src/main/proto/analyzer.proto`):
+
+1. the fully-qualified Column grants read or written, with `MaskedDisposition`
+   and output ordinals;
+2. every physical Table scanned, including scans that touch zero columns, each
+   marked `covered` or not;
+3. distinct named `Anonymous` function calls, plus explicit Function grants for
+   non-allowlisted no-FROM calls;
+4. classified Utility commands (SHOW/SET forms and unsafe cast/subquery forms);
+5. zero or more datasource action grants
+   (`sql.select`/`insert`/`update`/`delete`/`ddl`) and the relay
+   `StatementClass` (`ANALYZED`/`METADATA`/`SESSION`); and
+6. whether the statement is resolved, and if not, its `FailureClass`
+   (`INADMISSIBLE` hard-deny, or `UNANALYZABLE` → the `sql.unanalyzable` gate).
+
+Wire-path masking capability is decided after these facts (see
+[Unmaskable wire paths](#unmaskable-wire-paths)).
+
+## Cedar resource graph and actions
+
+The Cedar schema (`control-plane/src/main/resources/authz/schema.cedarschema`)
+models each resource type as an entity with `Datasource` and `Tag` parents:
+
+```cedar
+entity Datasource in [Tag] = { name?: String };
+entity Table in [Datasource, Tag];
+entity Column in [Table, Datasource, Tag];
+entity Function in [Datasource, Tag];
+entity Utility in [Datasource, Tag];
+```
+
+The data actions are `datasource.connect`,
+`sql.select`/`insert`/`update`/`delete`/`ddl`,
+`result.read.unmasked`/`result.read.masked`, and the two datasource-level
+exception gates `sql.unanalyzable`/`sql.unmaskable`. `Function` and `Utility`
+appear on the result-read actions alongside `Table` and `Column`.
+
+The request graph is assembled from live data on every decision:
+
+- catalog and connection state provide the fully-qualified identity;
+- user classification provides ordinary direct Column tags;
+- [system-classification.md](./system-classification.md) provides one immutable
+  shipped tag on each classified Table, Function, or Utility (a Column inherits
+  its Table's system tag rather than receiving a second direct system tag); and
+- the datasource provides its recognized posture
+  (`system:development`/`system:production`).
+
+### Result-read semantics per resource
+
+- Column: unchanged — an unmasked permit wins; otherwise a masked permit masks
+  the output; otherwise denied. The masked disposition (`MASK_OUTPUT`,
+  `REDACT_OUTPUT_NULL`, or `DENY_STATEMENT`) comes from the analyzer per grant.
+  A masked column in a write or a reference position (predicate/join/subquery)
+  cannot be masked and denies (see [derived-masking.md](./derived-masking.md)
+  for the redactable-transform exception).
+- Table (uncovered scan): either `result.read.unmasked` or `result.read.masked`
+  permits the scan — a masked reader already observes the table's existence and
+  row count through masked projections. No permit denies.
+- Function: called-function names are classified before marshalling.
+  `system:critical` is always forbidden; `system:data-leak` is forbidden on the
+  production posture and relaxed on `system:development`. Unclassified FROM'd
+  calls are not marshalled. An explicit no-FROM Function grant must classify; an
+  unclassified grant hard-denies.
+- Utility: a read permit covering the tagged `Utility` resource permits use; the
+  shipped `system:` forbids deny dangerous commands. A recognized Utility with
+  no governing manifest classification hard-denies before Cedar.
+
+Cedar's entity hierarchy keeps table-scoped policy ergonomic: a policy on a
+Table covers its Column children, and the Table entity itself satisfies the same
+selector. There is no separate `table.scan` or `function.call` action — result
+visibility is one capability across every data-producing resource.
+
+### Reserved tags are type-scoped
+
+`system:*` is reserved for the shipped classifier and for datasource posture.
+User-authored Column tags under that namespace are rejected on write and
+stripped defensively by the Cedar marshaller. A shipped system tag attaches
+directly to Table, Function, or Utility; a Column inherits its Table's tag. A
+Datasource carries only `system:development` or `system:production`. This is a
+security invariant, not UI validation: without it, a production PII Column
+hand-tagged `system:development` would satisfy the development unmasked permit
+and leak cleartext. Ordinary custom Column tags such as `pii` remain valid.
+
+## Scanned Tables — the zero-column gap
+
+A physical table with zero traced columns must still be authorized:
+`SELECT count(*) FROM orders`, `SELECT 1 FROM orders`,
+`SELECT EXISTS(SELECT 1 FROM orders)`, and `SELECT u.id FROM users u, orders o`
+each read `orders` and expose at least its existence and cardinality, so
+`orders` must be a Table resource even when no Column fact covers it.
+
+The analyzer walks each resolved scope's source map and emits a Table fact only
+when the source resolves to a physical backend relation. A CTE, derived table,
+table-valued expression, or alias is not a physical Table; the walk recurses
+into its scope and emits the physical relations it reads. This reuses the
+analyzer's scope resolution (`analyzer/probe/relation.go`) rather than
+collecting SQL names and subtracting a CTE-name set — that distinction is the
+safety property:
+
+```sql
+-- The outer orders is a CTE; the backend table is not read → no Table fact.
+WITH orders AS (SELECT 1) SELECT count(*) FROM orders;
+
+-- The CTE body resolves orders against the backend table → it is emitted.
+WITH orders AS (SELECT count(*) AS c FROM orders) SELECT c FROM orders;
+```
+
+Physical reads are included in every scope: set-operation branches, expression
+subqueries (`EXISTS`, `IN`), CTE bodies, `UPDATE ... FROM`, `DELETE ... USING`,
+and read-side sources synthesized for write analysis. A write target is not a
+scanned Table solely because it is the target — `INSERT INTO t VALUES (...)` is
+gated by `sql.insert`, not a new result-read grant. Any target data actually
+read (`RETURNING`, `ON CONFLICT`, expressions reading old values, write-payload
+lineage) already emits Column or physical-read facts.
+
+`covered` is computed from the final emitted facts: a table with any traced
+column is already exposed through it and needs no separate Table grant; a scan
+with no covering column fact requires `result.read.unmasked` or
+`result.read.masked` on the Table.
+
+<!-- prettier-ignore -->
+| statement | facts | result |
+| --- | --- | --- |
+| `SELECT rrn FROM users` | `users.rrn`; `users` covered by the column | column verdict |
+| `SELECT count(*) FROM users` | uncovered `users` scan | require read on `Table::.../users` |
+| `SELECT u.id FROM users u, orders o` | `users` covered; `orders` uncovered | require `users.id` and `orders` |
+| `WITH orders AS (SELECT 1) SELECT count(*) FROM orders` | no physical Table | no table-read gate |
+
+Verified by `KnownGapsTest` and `ScannedTableMySqlTest` (control-plane) and
+`scanned_sources_test.go` (analyzer, both engines).
+
+## Functions — dangerous-call gating
+
+The analyzer emits distinct lowercased bare names for function calls represented
+as `Anonymous` nodes. Standard built-ins with dedicated node kinds such as
+`count`, `cast`, and `substring` are not emitted. The control-plane classifies
+the names it receives and marshals only the dangerous set. A FROM'd dangerous
+call emits its name even when later analysis is unresolved. `system:critical`
+always denies; `system:data-leak` denies on production and may pass under
+`system:development`.
+
+For a governed datasource, `SystemClassificationService.tagForFunction` uses the
+governing manifest plus `BaselineDangerousFunctions`. With no governing manifest
+it uses the strongest classification across every shipped manifest for that
+engine, again with the baseline floor. The function gate runs before the column
+and uncovered-table gates, so a legitimate table-read grant cannot punch a
+classified function through.
+
+The no-FROM function allowlist lives in the analyzer
+(`analyzer/probe/facts.go`): any non-allowlisted anonymous call, or an untrusted
+qualified call, emits a Function grant. An unclassified grant hard-denies;
+classified grants follow their shipped system policy. Allowlisted no-FROM calls
+and dedicated safe built-ins emit no Function grant.
+
+Resolving every call as built-in vs UDF against a datasource function catalog,
+and vouching a data-reading UDF's output, is out of scope. A non-dangerous UDF
+in a FROM-backed query that reads a masked/PII column inside its body — never as
+a visible argument (an argument is already denied by the derived-expression
+rule) — passes unmasked, held by the operational rule that a UDF on a masking
+datasource must not read PII ([KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md)).
+
+## Analyzable
+
+`resolved=false` means the analyzer cannot prove complete resource/lineage facts
+— because of configuration validation, parse coverage, an unsupported analyzer
+root or data-modifying CTE, PIVOT, NATURAL JOIN, or an unresolved relation
+shape. Such a statement routes through the `sql.unanalyzable` datasource gate:
+
+1. `datasource.connect` and every emitted datasource action must still pass; an
+   unspecified action denies.
+2. If the analyzer reports `UNANALYZABLE`, the control-plane authorizes
+   `sql.unanalyzable` on the Datasource.
+3. Permit → relay the original statement verbatim, no rewrite or masks, with a
+   recorded reason.
+4. No permit / Cedar error / `INADMISSIBLE` → deny.
+
+An unanalyzable statement cannot claim that no sensitive resources were touched,
+so the exception is datasource-wide and explicit — suitable for a permissive
+development datasource, not a way to punch a single unknown query through
+production masking.
+
+`sql.unanalyzable` is a superset of write/exec authorization for the
+unanalyzable class. The class is not just weird reads: a data-modifying CTE
+(`WITH a AS (DELETE … RETURNING …) SELECT * FROM a`) is classified `SELECT` but
+rejected by the probe as unanalyzable, so a datasource granting `sql.select` +
+`sql.unanalyzable` but not `sql.delete` still executes the embedded DELETE,
+unmasked. This is the intended `system:development` posture (relay everything
+unanalyzable verbatim); production is deny-by-default. Enabling
+`sql.unanalyzable` therefore also enables writes/exec hidden in unanalyzable
+constructs, not a read-only convenience.
+
+The structural floor stays outside policy. Protocol framing/authentication and
+multi-statement ambiguity are hard denies that policy and query grants never
+override. MySQL executable comments are decoded and analyzed when the server
+version is known; a missing or invalid MySQL engine configuration routes through
+`sql.unanalyzable`.
+
+## Unmaskable wire paths
+
+`StatementFacts` has no maskability Boolean or reason enum. The control-plane
+computes the ordinary query verdict without knowing which result format a later
+wire execution will use.
+
+On a `MASK` verdict the control-plane sets `Verdict.unmaskable_permitted` when
+the datasource grants `sql.unmaskable`
+(`authorizeDatasourceAction(SQL_UNMASKABLE)`). The proxy relays the
+binary/prepared result unmasked only when that flag is set — checked in
+`goproxy/mysqlproxy/conn.go` and `goproxy/pgproxy/extended.go` — and otherwise
+refuses fail-closed. MySQL binary/prepared-statement results and PostgreSQL
+binary-format results have a relay path; COPY and fast-path do not and stay
+denied even where policy permits `sql.unmaskable`. That is an honest fail-closed
+capability gap, not a policy exception the proxy silently ignores.
+
+`EXPLAIN`-of-a-masked-query is a control-plane structural deny
+(`EXPLAIN_MASK_DENY`): there is no safe relay for it, so it stays denied
+regardless of policy.
+
+## End-to-end flow
+
+`decideQuery` runs, in order: analyze and hard-deny `INADMISSIBLE`; reject a
+deactivated principal; resolve roles and context; validate the facts contract;
+authorize `datasource.connect`; authorize classified Utility grants; handle
+zero-resource metadata/session passthrough; authorize each emitted datasource
+action; apply the dangerous-function and `sql.unanalyzable` gates for an
+unresolved statement; then authorize classified functions, Columns, and
+uncovered Tables. An EXPLAIN that would MASK is denied. For any remaining MASK
+verdict, the control-plane checks `sql.unmaskable` and carries the result as a
+capability flag for the proxy. Every gate runs before the backend receives the
+statement.
+
+Assuming `datasource.connect` and `sql.select` pass:
+
+<!-- prettier-ignore -->
+| query / feature | emitted facts | production masking datasource | development datasource |
+| --- | --- | --- | --- |
+| `SELECT count(*) FROM orders` | uncovered Table `orders` | DENY without a Table read grant | permit if policy grants broad read |
+| `SELECT lower(email) FROM users` | derived Column `email`; no Function fact | masked output is redacted to NULL | ALLOW unmasked under dev posture |
+| `SELECT dblink(…) FROM t` | named Function `dblink` (`system:data-leak`) | DENY (function forbid) | ALLOW under the dev relaxation |
+| `SELECT * FROM information_schema.tables` | system Table/Columns tagged `system:catalog` | catalog permit | catalog permit |
+| `SHOW FULL PROCESSLIST` | Utility → activity resource | DENY | dev activity policy may permit |
+| `SET GLOBAL general_log=ON` | critical Utility | DENY | DENY |
+| unsupported analyzer shape | `resolved=false` | DENY | relay only with `sql.unanalyzable` |
+| PG COPY OUT | unsupported root (`resolved=false`) | DENY | proxy still DENYs COPY after any exception permit |
+
+## Contract and version skew
+
+The analyzer↔JVM boundary and the control-plane↔proxy boundary are both protobuf
+(`proto/src/main/proto/analyzer.proto`, `controlplane.proto`). Generated
+bindings catch incompatible source changes at build time, but deployed protobuf
+peers can ignore unknown fields. Zero-value sentinels, required-resource checks,
+and absent-false capability flags therefore deny missing or malformed contract
+data at runtime. The control-plane is the only Cedar evaluator. The proxy's
+local admission remains a strict structural backstop: it rejects
+framing/engine-safety inputs and may over-deny a statement a newer control-plane
+would permit, but it must never under-deny one.
+
+## Conservation invariants
+
+1. A physical read omitted from the sources is a leak. The scope-graph sweep and
+   the zero-column adversarial suite are release gates.
+2. A dangerous named function call omitted from `functions` or an explicit
+   Function grant is a leak. Dedicated safe built-ins are intentionally absent.
+3. A classified utility omitted is a leak. Every recognized command id is either
+   a mapped resource fact or an explicit metadata/session operation.
+4. Unknown identity is never safe: an unknown relation resolution makes the
+   statement unanalyzable.
+5. Unknown lineage context is never dropped: it requires unmasked permission.
+6. Missing `unmaskable_permitted` is false; unsupported relay paths deny.
+7. Policy cannot create a data-plane capability: a permit plus an unsupported
+   relay still denies.
+8. A DENY names the resource/gate and reason; an unanalyzable exception ALLOW
+   records the exception fact and reason.

@@ -1,0 +1,92 @@
+{
+  "header": {
+    "title": "Connection tokens",
+    "subtitle": "Time-limited credentials for connecting through the proxy. Tokens always expire — there are no permanent secrets."
+  },
+  "generate": "Generate token",
+  "modes": {
+    "oneShotTitle": "One-shot connection password",
+    "oneShotBody": "Generate a token and paste it as the password in psql / mysql / DataGrip. It stops working when it expires; generate a new one next time.",
+    "brokerTitle": "Local broker (stable connection)",
+    "brokerBody": "Run pmon login — the daemon holds your token and opens a local port per datasource; pmon show prints the connection string. Point your client at it with any password and a connection string that never changes. The token is not renewed automatically; run pmon login again when it expires."
+  },
+  "loading": "Loading tokens…",
+  "empty": {
+    "title": "No tokens yet.",
+    "hint": "Generate a connection token, or run the pmon CLI to mint one."
+  },
+  "section": {
+    "active": "Active",
+    "inactive": "Expired / revoked"
+  },
+  "table": {
+    "name": "Name",
+    "kind": "Kind",
+    "status": "Status",
+    "lastUsed": "Last used",
+    "actions": "Actions"
+  },
+  "kind": {
+    "broker": "broker",
+    "connect": "connect"
+  },
+  "name": {
+    "daemonSession": "daemon session",
+    "unnamed": "unnamed"
+  },
+  "lastUsed": {
+    "never": "never",
+    "justNow": "just now",
+    "minutesAgo": "{minutes}m ago",
+    "hoursAgo": "{hours}h ago"
+  },
+  "expiry": {
+    "revoked": "revoked",
+    "expired": "expired",
+    "inMinutes": "expires in {minutes}m",
+    "inHours": "expires in {hours}h",
+    "onDate": "expires {date}"
+  },
+  "revoke": {
+    "action": "Revoke",
+    "success": "Token revoked.",
+    "failed": "Revoke failed"
+  },
+  "countdown": {
+    "noExpiry": "no expiry",
+    "expired": "expired"
+  },
+  "reject": {
+    "title": "Reject request",
+    "descriptionQuery": "Rejecting query request from {principal}.",
+    "descriptionAccess": "Rejecting access request from {principal} for role \"{role}\".",
+    "descriptionFallback": "Reject access request.",
+    "failed": "reject failed",
+    "reasonLabel": "Reason (required)",
+    "reasonPlaceholder": "Scope too broad — narrow to orders/customers and re-request.",
+    "cancel": "Cancel",
+    "submit": "Reject",
+    "submitting": "Rejecting…"
+  },
+  "directConnect": {
+    "title": "Connect a SQL client directly",
+    "intro": "pmon is the recommended path — it brokers a short-lived token and pins the proxy's certificate for you. Connect directly when you would rather point psql, mysql, or DataGrip at the proxy yourself.",
+    "noneConnectable": "You have no datasources you may connect to.",
+    "noAddress": "This datasource's proxy has not advertised a client-facing address yet.",
+    "tls": "TLS",
+    "tlsOn": "Enabled — download the certificate and point your client at it.",
+    "tlsSystemTrust": "Enabled. This proxy uses a publicly trusted certificate and publishes none, so your client verifies it against its own trust store — no certificate file needed.",
+    "tlsOff": "Not enabled on this proxy. A direct connection would be unencrypted, so use pmon on a trusted network instead.",
+    "download": "Download certificate",
+    "downloadFailed": "Could not download the certificate",
+    "rotationNote": "Rotating the proxy's certificate invalidates a downloaded copy — download it again after a rotation.",
+    "verifyModeNote": "verify-full checks the certificate and that it covers the address you dialed. If your certificate does not cover that address (no matching hostname or IP SAN), fall back to verify-ca — it still verifies the certificate, only not the identity.",
+    "copy": "Copy",
+    "clients": {
+      "psql": "psql",
+      "mysql": "mysql",
+      "datagrip": "DataGrip"
+    },
+    "datagripHelp": "In DataGrip: Data Sources → your connection → SSH/SSL → Use SSL, set CA file to the downloaded certificate and Mode to {mode}."
+  }
+}

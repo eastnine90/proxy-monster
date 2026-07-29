@@ -1,0 +1,4 @@
+# build output
+/dist/
+# `go build ./...` drops the binary here, named after the module
+/pmontray

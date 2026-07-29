@@ -1,0 +1,31 @@
+{
+  "$comment": [
+    "The database versions proxy-monster supports, and the container image each version is tested",
+    "against. This file is the ONE place the set is declared: the CI matrix generates its legs from",
+    "it, and DbSupportMatrixTest fails the build if the engine's bundled classification manifests and",
+    "this file disagree in either direction. Adding a version means editing this file, adding the",
+    "manifest, and nothing else.",
+    "",
+    "'target' engines are the databases the proxy brokers queries TO. Every target series needs a",
+    "bundled system-classification manifest, because the classifier's system-catalog and",
+    "dangerous-function tags are version-specific.",
+    "",
+    "'storage' engines are what the control-plane keeps its own state in. PostgreSQL only: the store",
+    "SQL uses RETURNING, ON CONFLICT, jsonb and :: casts.",
+    "",
+    "Series is the granularity support is claimed at (PostgreSQL major, MySQL major.minor); the image",
+    "tag is a floating pin within that series, so a patch release is picked up without touching this",
+    "file. A test asserts the live server's series matches the image it was configured with, so a",
+    "matrix leg cannot silently run against the wrong version."
+  ],
+  "target": [
+    { "engine": "mysql", "series": "8.0", "image": "mysql:8.0" },
+    { "engine": "mysql", "series": "8.4", "image": "mysql:8.4" },
+    { "engine": "postgres", "series": "16", "image": "postgres:16" },
+    { "engine": "postgres", "series": "17", "image": "postgres:17" }
+  ],
+  "storage": [
+    { "engine": "postgres", "series": "16", "image": "postgres:16" },
+    { "engine": "postgres", "series": "17", "image": "postgres:17" }
+  ]
+}

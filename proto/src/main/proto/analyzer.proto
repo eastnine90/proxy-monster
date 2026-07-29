@@ -1,0 +1,203 @@
+syntax = "proto3";
+
+// The analyzer <-> JVM wire protocol (docs/statement-facts-contract.md). Single source of
+// truth for both sides' generated bindings at the sqlglot-go FFM boundary (analyzer/cmd/libsqlglot
+// <-> analyzer/jvm's java.lang.foreign binding). Distinct wire boundary from controlplane.proto (that
+// one is proxy<->control-plane gRPC); own file/package so a `buf generate` scoped to this boundary
+// never touches that file's messages/services — the one thing both boundaries share, the engine
+// identity, lives in the minimal engine.proto instead, imported by both.
+//
+// AnalyzeRequest carries the analyzer input and StatementFacts is the complete response contract for
+// this call. Go emits every SQL-derived authorization requirement; consumers never parse SQL shape.
+package proxymonster.analyzer.v1;
+
+import "engine.proto";
+
+option java_package = "com.ridi.oss.proxymonster.analyzer.pb";
+option java_multiple_files = true;
+
+// ---- request side ----
+
+// A schema/table/column identity — a catalog column's own identity (ColumnSpec, below). No catalog:
+// a bare schema/table/column identity never deals in a cross-catalog identity.
+message RelationIdentity {
+  string schema = 1;
+  string table = 2;
+  string column = 3;
+}
+
+// A physical catalog column, flat (no nested tree) — Go builds its own schema.Mapping tree from the
+// flat list; the Kotlin caller already holds a flat List<ColumnSpec> natively (CatalogApi.kt), so this
+// needs no tree-walking encoder or decoder on either side.
+message ColumnSpec {
+  string catalog = 1;
+  RelationIdentity identity = 2;
+  string data_type = 3;
+  bool pii = 4;
+}
+
+// The datasource namespace used to resolve unqualified table names. Engine-specific settings (case
+// folding, server version) do NOT live here — see EngineConfig — a namespace is the same shape for
+// every engine.
+message Namespace {
+  string catalog = 1;
+  repeated string search_path = 2;
+  reserved 3;
+  reserved "mysql_lower_case_table_names";
+  reserved 4;
+  reserved "mysql_version_id";
+}
+
+// Every engine-specific analysis setting, grouped so the analyzer builds its sqlglot-go Dialect once
+// from one input. [engine] reuses proxymonster.v1.Engine (controlplane.proto) — the same enum the
+// proxy registers with — rather than a second, parallel MySQL/Postgres type. The caller (control-plane)
+// forwards this as-is from what the proxy already reported at introspection time; it does not
+// re-derive or re-parse any of these values itself.
+message EngineConfig {
+  proxymonster.v1.Engine engine = 1;
+  // The target server's version as a clean major.minor[.patch] string. Required and validated for
+  // MySQL: analysis fails closed at VALIDATE without a parseable version. PostgreSQL carries the
+  // value for the wire contract but does not currently use it during analysis.
+  string engine_version = 2;
+  // MySQL's server-level lower_case_table_names setting (0..2), required for MySQL. Absent for
+  // PostgreSQL, which has no equivalent setting.
+  optional int32 mysql_lower_case_table_names = 3;
+  // Whether the backend's live MySQL session sql_mode has ANSI_QUOTES active. When true the analyzer
+  // builds the MySQL dialect with the mysql_ansi_quotes tokenizer state, so `"col"` parses as a quoted
+  // IDENTIFIER (a masked column read) rather than a string literal — matching the server, so a masked
+  // column quoted with `"` is still masked instead of leaking cleartext. sql_mode is mutable per
+  // session, so this is observed and forwarded per statement. Absent/false for PostgreSQL and for the
+  // default MySQL mode (`"` is a string).
+  optional bool mysql_ansi_quotes = 4;
+}
+
+message AnalyzeRequest {
+  string sql = 1;
+  reserved 2;
+  reserved "dialect";
+  Namespace namespace = 3;
+  repeated ColumnSpec catalog = 4;
+  reserved 5;
+  reserved "engine_version";
+  EngineConfig engine_config = 6;
+}
+
+// ---- response side ----
+
+// One physical backend relation the statement scans (docs/facts-emission.md). catalog/schema/table
+// is the resolved identity; covered is true once at least one traced column fact names this table
+// (see probe.go's SourceInfo doc comment for the full per-table coverage rationale).
+message SourceInfo {
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
+  bool covered = 4;
+}
+
+// A Cedar action required to execute or return a statement. The zero value is invalid and must deny.
+enum GrantAction {
+  GRANT_ACTION_UNSPECIFIED = 0;
+  GRANT_ACTION_SQL_SELECT = 1;
+  GRANT_ACTION_SQL_INSERT = 2;
+  GRANT_ACTION_SQL_UPDATE = 3;
+  GRANT_ACTION_SQL_DELETE = 4;
+  GRANT_ACTION_SQL_DDL = 5;
+  GRANT_ACTION_RESULT_READ = 6;
+}
+
+// How a MASKED verdict applies to a grant. DENIED always denies the entire statement, regardless of
+// this value. The zero value is invalid and must deny.
+enum MaskedDisposition {
+  MASKED_DISPOSITION_UNSPECIFIED = 0;
+  MASKED_DISPOSITION_DENY_STATEMENT = 1;
+  MASKED_DISPOSITION_MASK_OUTPUT = 2;
+  MASKED_DISPOSITION_REDACT_OUTPUT_NULL = 3;
+}
+
+// The statement's relay behavior after all required grants are satisfied. The zero value is invalid
+// and must deny rather than being treated as an empty passthrough class.
+enum StatementClass {
+  STATEMENT_CLASS_UNSPECIFIED = 0;
+  STATEMENT_CLASS_ANALYZED = 1;
+  STATEMENT_CLASS_METADATA = 2;
+  STATEMENT_CLASS_SESSION = 3;
+}
+
+// The security class of an unresolved statement. The zero value is invalid and must hard-deny.
+enum FailureClass {
+  FAILURE_CLASS_UNSPECIFIED = 0;
+  // A structurally forbidden statement that policy and query grants must never override.
+  FAILURE_CLASS_INADMISSIBLE = 1;
+  // A single statement whose meaning Go could not fully resolve; Kotlin applies sql.unanalyzable.
+  FAILURE_CLASS_UNANALYZABLE = 2;
+}
+
+message ColumnResource {
+  string catalog = 1;
+  RelationIdentity identity = 2;
+}
+
+message TableResource {
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
+}
+
+message FunctionResource {
+  string name = 1;
+}
+
+message UtilityResource {
+  // Canonical system-classification manifest command id, never raw SQL text.
+  string command = 1;
+}
+
+message RequiredGrant {
+  // UNSPECIFIED is never grantable and must deny fail-closed.
+  GrantAction action = 1;
+  oneof resource {
+    ColumnResource column = 2;
+    TableResource table = 3;
+    FunctionResource function = 4;
+    UtilityResource utility = 5;
+    // Presence marks the current datasource; Kotlin supplies its name when rendering the resource.
+    bool datasource = 6;
+  }
+  // Consulted only for a MASKED authorization verdict. DENIED always denies the statement, and
+  // UNSPECIFIED must deny even if the resource would otherwise be maskable.
+  MaskedDisposition masked_disposition = 7;
+  // Zero-based positions in StatementFacts.output_columns. Invalid ordinals must deny fail-closed.
+  repeated int32 output_ordinals = 8;
+}
+
+message StatementFacts {
+  // True only after complete statement analysis. False requires a non-zero failure_class.
+  bool resolved = 1;
+  // INADMISSIBLE hard-denies; UNANALYZABLE enters the existing sql.unanalyzable policy gate;
+  // UNSPECIFIED hard-denies.
+  FailureClass failure_class = 2;
+  // The failing analyzer stage (PARSE, VALIDATE, CONVERT, or LINEAGE), absent on success.
+  optional string failed_stage = 3;
+  // Stable diagnostic detail for audit. Empty failure detail is still a denial, never an allow.
+  string detail = 4;
+  // ANALYZED, METADATA, or SESSION relay class. UNSPECIFIED denies fail-closed.
+  StatementClass statement_class = 5;
+  // Complete authorization requirements. Missing or malformed resources/actions deny fail-closed.
+  repeated RequiredGrant required_grants = 6;
+  // Ordered backend output names; RequiredGrant.output_ordinals indexes this exact list.
+  repeated string output_columns = 7;
+  // True when returning masked input would be unsafe because the statement writes it.
+  bool is_write = 8;
+  // Safe analyzer rewrite (currently faithful star expansion); absent means relay the client's SQL.
+  optional string rewritten_sql = 9;
+  // True when grants describe an inner query under EXPLAIN; rewritten_sql must then remain absent.
+  bool explain_of_query = 10;
+  // True only for non-temporary DDL roots; Kotlin also treats called functions as catalog-changing.
+  bool catalog_changing = 11;
+  // Resolved physical source identities. Missing required sources is an analyzer failure, not allow.
+  repeated SourceInfo sources = 12;
+  // Distinct called-function names, including those recovered from an unresolved parsed statement.
+  repeated string functions = 13;
+  // Dotted identifier schema candidates used only to retry a catalog miss with refreshed metadata.
+  repeated string schema_qualifier_candidates = 14;
+}

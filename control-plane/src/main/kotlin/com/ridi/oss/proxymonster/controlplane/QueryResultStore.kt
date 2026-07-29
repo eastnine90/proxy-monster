@@ -1,0 +1,289 @@
+package com.ridi.oss.proxymonster.controlplane
+
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.json.Json
+import java.sql.Connection
+import java.sql.ResultSet
+import java.sql.Timestamp
+import java.time.Instant
+import javax.sql.DataSource
+import org.postgresql.util.PGobject
+
+@Serializable
+data class QueryResultMeta(
+    val taskId: Long,
+    val executedBy: String? = null,
+    val executedAt: String? = null,
+    val rowCount: Int? = null,
+    val expiresAt: String? = null,
+    val status: String? = null,
+    val errorCode: String? = null,
+    val columns: List<String> = emptyList(),
+)
+
+@Serializable
+data class DecryptedResult(val columns: List<String>, val rows: List<List<String?>>)
+
+/**
+ * A single-read snapshot of a task's latest result child: its [meta], the child's own [sql] (the exact
+ * statement that produced the ciphertext), plus a payload that is decrypted lazily. Capturing [sql] and the
+ * ciphertext from the SAME child in one read is what lets the view re-decide the released bytes against
+ * their own statement — not the task's first-child SQL, which can diverge once a task holds plural children.
+ * Decryption is deferred to the first read of [decrypted], so a caller that rejects on [meta] alone — an
+ * unauthorized viewer, or a not-ready status — never triggers the decrypt. The ciphertext and meta are
+ * captured by one read in [QueryResultStore.accessFor], so a concurrent re-execute cannot swap the row
+ * between an authorization check on [meta] and this decrypt.
+ */
+class ResultAccess(val meta: QueryResultMeta, val sql: String?, decrypt: () -> DecryptedResult?) {
+    val decrypted: DecryptedResult? by lazy(decrypt)
+}
+
+class QueryResultStore(private val dataSource: DataSource, private val crypto: ResultCrypto) {
+    private val json = Json
+    private val payloadSerializer = DecryptedResult.serializer()
+    private val stringList = ListSerializer(String.serializer())
+
+    private fun ResultSet.toMeta() = QueryResultMeta(
+        taskId = getLong("task_id"),
+        executedBy = getString("executed_by"),
+        executedAt = getTimestamp("executed_at")?.toInstant()?.toString(),
+        rowCount = getInt("row_count").let { if (wasNull()) null else it },
+        expiresAt = getTimestamp("expires_at")?.toInstant()?.toString(),
+        status = getString("status"),
+        errorCode = getString("error_code"),
+        columns = json.decodeFromString(stringList, getString("columns") ?: "[]"),
+    )
+
+    fun startRun(taskId: Long, executedBy: String): QueryResultMeta? = dataSource.connection.use { c ->
+        val childId = latestChildId(c, taskId, "status IS NULL") ?: return@use null
+        val started = c.prepareStatement(
+            "UPDATE query_result SET status = 'RUNNING', executed_by = ?, error_code = NULL WHERE id = ? AND status IS NULL",
+        ).use { ps ->
+            ps.setString(1, executedBy)
+            ps.setLong(2, childId)
+            ps.executeUpdate() > 0
+        }
+        if (started) meta(taskId, c) else null
+    }
+
+    /**
+     * Atomically claim a task for execution AND start its run: the parent's `APPROVED → EXECUTING` flip
+     * (via [claimParent]) and the child's `NULL → RUNNING` flip commit in ONE transaction. This closes the
+     * window a separate claim-then-start left open — where a cancel arriving between the two saw an
+     * `EXECUTING` parent with no `RUNNING` child yet, so [cancelRun] no-oped and the query ran anyway. After
+     * this, an `EXECUTING` task always has a `RUNNING` child for a cancel to catch.
+     *
+     * Returns the `RUNNING` child meta on success; `null` when [claimParent] finds the task not `APPROVED`
+     * (already claimed/terminal → the caller treats it as already-executed). A claimed parent with no
+     * pending child is an invariant violation that rolls the whole claim back (leaving the task `APPROVED`).
+     */
+    fun claimAndStartRun(
+        taskId: Long,
+        executedBy: String,
+        claimParent: (Connection) -> Boolean,
+    ): QueryResultMeta? = dataSource.inTx { c ->
+        if (!claimParent(c)) return@inTx null
+        val childId = latestChildId(c, taskId, "status IS NULL")
+            ?: error("task $taskId claimed for execution but has no pending child")
+        val started = c.prepareStatement(
+            "UPDATE query_result SET status = 'RUNNING', executed_by = ?, error_code = NULL WHERE id = ? AND status IS NULL",
+        ).use { ps ->
+            ps.setString(1, executedBy)
+            ps.setLong(2, childId)
+            ps.executeUpdate() > 0
+        }
+        if (!started) error("task $taskId child $childId not startable")
+        meta(taskId, c)
+    }
+
+    fun completeRun(
+        taskId: Long,
+        result: DecryptedResult,
+        retentionSec: Long,
+        audit: (Connection, QueryResultMeta) -> Unit = { _, _ -> },
+    ): QueryResultMeta? {
+        val blob = crypto.encrypt(json.encodeToString(payloadSerializer, result).toByteArray(Charsets.UTF_8))
+        val now = Instant.now()
+        return dataSource.inTx { c ->
+            val childId = latestChildId(c, taskId, "status = 'RUNNING'")
+            val updated = childId != null && c.prepareStatement(
+                """UPDATE query_result
+                   SET status = 'DONE', ciphertext = ?, row_count = ?, columns = ?,
+                       executed_at = ?, expires_at = ?, error_code = NULL
+                   WHERE id = ? AND status = 'RUNNING'""",
+            ).use { ps ->
+                ps.setBytes(1, blob)
+                ps.setInt(2, result.rows.size)
+                val columnsJson = json.encodeToString(stringList, result.columns)
+                if (c.metaData.databaseProductName.contains("PostgreSQL", ignoreCase = true)) {
+                    ps.setObject(3, PGobject().apply { type = "jsonb"; value = columnsJson })
+                } else {
+                    ps.setString(3, columnsJson)
+                }
+                ps.setTimestamp(4, Timestamp.from(now))
+                ps.setTimestamp(5, Timestamp.from(now.plusSeconds(retentionSec)))
+                ps.setLong(6, childId)
+                ps.executeUpdate() > 0
+            }
+            val meta = if (updated) meta(taskId, c) else null
+            if (meta != null) audit(c, meta)
+            meta
+        }
+    }
+
+    fun failRun(
+        taskId: Long,
+        errorCode: String,
+        // Runs in the SAME transaction as the child's RUNNING → FAILED flip (mirrors [completeRun]'s
+        // audit hook) so the caller can terminalize the parent task atomically with the child. A throw
+        // here rolls the child transition back too, keeping the two consistent.
+        onFailed: (Connection, QueryResultMeta) -> Unit = { _, _ -> },
+    ): QueryResultMeta? = dataSource.inTx { c ->
+        val now = Instant.now()
+        val childId = latestChildId(c, taskId, "status = 'RUNNING'")
+        val updated = childId != null && c.prepareStatement(
+            "UPDATE query_result SET status = 'FAILED', error_code = ?, expires_at = ? WHERE id = ? AND status = 'RUNNING'",
+        ).use { ps ->
+            ps.setString(1, errorCode)
+            ps.setTimestamp(2, Timestamp.from(now.plusSeconds(RESULT_RETENTION_SEC)))
+            ps.setLong(3, childId)
+            ps.executeUpdate() > 0
+        }
+        val meta = if (updated) meta(taskId, c) else null
+        if (meta != null) onFailed(c, meta)
+        meta
+    }
+
+    fun cancelRun(
+        taskId: Long,
+        onCancelled: (Connection, QueryResultMeta) -> Unit = { _, _ -> },
+    ): QueryResultMeta? = dataSource.inTx { c ->
+        val now = Instant.now()
+        val childId = latestChildId(c, taskId, "status = 'RUNNING'")
+        val updated = childId != null && c.prepareStatement(
+            "UPDATE query_result SET status = 'CANCELLED', error_code = 'approval.canceled', expires_at = ? " +
+                "WHERE id = ? AND status = 'RUNNING'",
+        ).use { ps ->
+            ps.setTimestamp(1, Timestamp.from(now.plusSeconds(RESULT_RETENTION_SEC)))
+            ps.setLong(2, childId)
+            ps.executeUpdate() > 0
+        }
+        val meta = if (updated) meta(taskId, c) else null
+        if (meta != null) onCancelled(c, meta)
+        meta
+    }
+
+    fun meta(taskId: Long): QueryResultMeta? = dataSource.connection.use { c -> meta(taskId, c) }
+
+    // The active child is selected by a SEPARATE read, then updated by its own id. The per-status guard
+    // stays on the UPDATE, so the transition is still a race-safe compare-and-set.
+    private fun latestChildId(c: Connection, taskId: Long, statusClause: String): Long? = c.prepareStatement(
+        "SELECT id FROM query_result WHERE task_id = ? AND $statusClause ORDER BY id DESC LIMIT 1",
+    ).use { ps ->
+        ps.setLong(1, taskId)
+        ps.executeQuery().use { rs -> if (rs.next()) rs.getLong(1) else null }
+    }
+
+    private fun meta(taskId: Long, c: Connection): QueryResultMeta? = c.prepareStatement(
+        "SELECT $META_COLS FROM query_result WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+    ).use { ps ->
+        ps.setLong(1, taskId)
+        ps.executeQuery().use { rs -> if (rs.next()) rs.toMeta() else null }
+    }
+
+    fun accessFor(taskId: Long): ResultAccess? {
+        val row = dataSource.connection.use { c ->
+            c.prepareStatement(
+                // Reading qr.sql in the SAME row as the ciphertext binds the view's re-decision to the
+                // released bytes.
+                "SELECT $META_COLS, qr.sql, ciphertext FROM query_result qr WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            ).use { ps ->
+                ps.setLong(1, taskId)
+                ps.executeQuery().use { rs ->
+                    if (!rs.next()) return null
+                    Triple(rs.toMeta(), rs.getString("sql"), rs.getBytes("ciphertext"))
+                }
+            }
+        }
+        val (meta, sql, ciphertext) = row
+        val expired = meta.expiresAt != null && Instant.parse(meta.expiresAt).isBefore(Instant.now())
+        if (expired) purgeExpired()
+        // Only a DONE, unexpired, still-populated child holds a decryptable payload; anything else (not
+        // ready, expired, or payload already purged) decrypts to null, so the route surfaces 409/410 rather
+        // than any bytes. The decrypt itself runs lazily on first read of [ResultAccess.decrypted] — after
+        // the caller has authorized on [meta].
+        val payload = if (meta.status == "DONE" && !expired) ciphertext else null
+        return ResultAccess(meta, sql) {
+            payload?.let { json.decodeFromString(payloadSerializer, crypto.decrypt(it).toString(Charsets.UTF_8)) }
+        }
+    }
+
+    // Expiry drops the decryptable PAYLOAD (ciphertext, row_count, columns) and clears expires_at, but keeps
+    // the child row and its sql/sql_hash/status/error_code/executed_* for durable audit and web preview. A
+    // purged row still exists yet reads back with no payload (accessFor's `decrypted` is null → the route
+    // returns 410). Clearing expires_at makes the row fall out of this sweep's WHERE, so it isn't reprocessed.
+    fun purgeExpired(): Int = dataSource.connection.use { c ->
+        c.prepareStatement(
+            "UPDATE query_result SET ciphertext = NULL, row_count = NULL, columns = NULL, expires_at = NULL " +
+                "WHERE expires_at <= ?",
+        ).use { ps ->
+            ps.setTimestamp(1, Timestamp.from(Instant.now()))
+            ps.executeUpdate()
+        }
+    }
+
+    /** Drop the result child(ren) of one task outright (close-tab). Editor tabs are 1:child, so this
+     *  removes exactly the tab's saved rows. Returns the number of rows deleted (0 = already gone → idempotent). */
+    fun deleteResultsForTask(taskId: Long): Int = dataSource.connection.use { c ->
+        c.prepareStatement("DELETE FROM query_result WHERE task_id = ?").use { ps ->
+            ps.setLong(1, taskId)
+            ps.executeUpdate()
+        }
+    }
+
+    /** Drop every EDITOR result child owned by [principal] — the delete-on-session-end backstop (logout,
+     *  deprovision, device-mismatch, newest-wins displacement all funnel through PrincipalSessionStore's
+     *  end seam). Only EDITOR children are removed; a workflow task's saved result is untouched. */
+    fun deleteEditorResultsForPrincipal(principal: String): Int =
+        dataSource.connection.use { c -> deleteEditorResultsForPrincipal(principal, c) }
+
+    /** Same as [deleteEditorResultsForPrincipal], composed onto a caller-supplied connection [c] — the
+     *  session-end seam passes the connection that performed the end-write, so this delete joins the same
+     *  transaction and commits or rolls back atomically with it (never orphaning a committed delete under a
+     *  rolled-back deprovision teardown).
+     *
+     *  Deletes the principal's EDITOR *tasks* (access_request), cascading their query_result children, rather
+     *  than only the children: dropping the whole task terminalizes any that were still EXECUTING when the
+     *  session ended (a child-only delete would strand the parent EXECUTING until the boot reconcile) and
+     *  leaves no empty editor task rows behind. Only creator_kind='EDITOR' rows for this principal — a
+     *  WORKFLOW approval is never touched. */
+    fun deleteEditorResultsForPrincipal(principal: String, c: Connection): Int = c.prepareStatement(
+        "DELETE FROM access_request WHERE creator_kind = 'EDITOR' AND principal = ?",
+    ).use { ps ->
+        ps.setString(1, principal)
+        ps.executeUpdate()
+    }
+
+    /**
+     * GC expired EDITOR result children by DELETING them outright — unlike [purgeExpired], which keeps a
+     * workflow child's row (NULLs only the payload) for durable audit/preview. An editor tab has no such
+     * audit obligation, so its expired child is removed whole. Runs on the same background sweep.
+     */
+    fun purgeExpiredEditorChildren(): Int = dataSource.connection.use { c ->
+        c.prepareStatement(
+            "DELETE FROM query_result WHERE expires_at <= ? AND task_id IN " +
+                "(SELECT id FROM access_request WHERE creator_kind = 'EDITOR')",
+        ).use { ps ->
+            ps.setTimestamp(1, Timestamp.from(Instant.now()))
+            ps.executeUpdate()
+        }
+    }
+
+    companion object {
+        const val RESULT_RETENTION_SEC = 86_400L
+        private const val META_COLS =
+            "task_id, executed_by, executed_at, row_count, expires_at, status, error_code, columns"
+    }
+}

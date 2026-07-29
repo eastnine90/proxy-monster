@@ -1,0 +1,18 @@
+{
+  "primaryNavigation": "기본 내비게이션",
+  "query": "쿼리",
+  "workflows": "워크플로우",
+  "access": "액세스",
+  "audit": "감사 로그",
+  "admin": "관리",
+  "adminSubtitle": "시스템 설정",
+  "adminNavLabel": "관리 내비게이션",
+  "datasources": "데이터소스",
+  "policies": "정책",
+  "users": "사용자",
+  "groups": "그룹",
+  "policyRoles": "역할",
+  "policyAssignments": "할당",
+  "policyMaskFns": "마스킹 함수",
+  "policyCedarPolicies": "Cedar 정책"
+}

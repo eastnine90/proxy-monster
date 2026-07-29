@@ -1,0 +1,15 @@
+# Not ours to format.
+node_modules/
+web/.next/
+build/
+**/build/
+.gradle/
+.kotlin/
+web/pnpm-lock.yaml
+web/test-results/
+web/playwright-report/
+
+# Byte-compared fixtures. These are regression goldens a test diffs verbatim, so reflowing them
+# rewrites the thing under test.
+analyzer/probe/testdata/
+control-plane/src/test/resources/atrail/

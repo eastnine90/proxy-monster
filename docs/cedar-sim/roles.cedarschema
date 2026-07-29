@@ -1,0 +1,17 @@
+// Minimal slice of the proxy-monster authz schema, enough to test the
+// "assume request.role at result-view" masking model.
+entity Role;
+entity Tag;
+entity User in [Role];
+entity Column in [Tag];
+
+action "result.read.unmasked" appliesTo {
+  principal: [User],
+  resource: [Column],
+  context: { "network_zones": Set<String> }
+};
+action "result.read.masked" appliesTo {
+  principal: [User],
+  resource: [Column],
+  context: { "network_zones": Set<String> }
+};

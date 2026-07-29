@@ -1,0 +1,219 @@
+package com.ridi.oss.proxymonster.controlplane
+
+import com.cedarpolicy.value.IpAddress
+import com.ridi.oss.proxymonster.controlplane.authz.AuthzContext
+import io.ktor.server.application.ApplicationCall
+import java.net.InetAddress
+
+/**
+ * The HTTP-side counterpart of [parseRequesterIp] (docs/authz-context.md), which resolves the wire proxy's
+ * client_addr. An HTTP request's SOCKET PEER is trustworthy on its own —
+ * it's a fact of the TCP connection, never client-supplied — but the moment a load balancer / reverse proxy
+ * sits in front of the control-plane, the socket peer is the EDGE, not the end client, and the true client
+ * address only appears in a header (`X-Forwarded-For`) the CLIENT can also forge. So `X-Forwarded-For` is
+ * honored ONLY when the socket peer is a configured [trustedProxies] entry (anti-spoof invariant,
+ * authz-context.md "Server-attested, never client-asserted") — an arbitrary caller cannot spoof requester_ip
+ * simply by setting the header, because doing so requires ALSO controlling the trusted edge's socket address.
+ *
+ * When trusted, the RIGHTMOST comma-separated `X-Forwarded-For` entry is taken — by X-Forwarded-For
+ * convention that's the entry the trusted edge itself appended; every entry to its left was supplied by
+ * whatever sits upstream of the edge (the client, or another untrusted hop) and is not attested here. Once
+ * the peer is known to be a trusted edge, its OWN socket address is NEVER used as the requester_ip (the edge
+ * is not the end client): a missing, blank, or malformed rightmost XFF entry resolves to `null` — the
+ * attribute goes absent and a policy conditioning on it fails closed, rather than silently attributing the
+ * request to the edge's own address. Never throws. The trusted-edge set is [Config.trustedProxies].
+ *
+ * [peerAddress] is the bare socket-peer address (already free of a port — see [ApplicationCall.httpRequesterIp]
+ * for how it's obtained from Ktor). [xff] is the raw (possibly multi-hop, comma-separated) header value.
+ */
+/**
+ * True when the socket peer is a configured trusted edge — the ONE definition of "this hop may speak for
+ * the client", shared by every `X-Forwarded-*` consumer so the anti-spoof invariant cannot drift between
+ * them (a second hand-rolled copy of this test is how a header ends up honored from an untrusted peer).
+ *
+ * An entry is either a literal address or a CIDR block (`10.10.0.0/16`, `2001:db8::/32`). A block is
+ * what a real deployment needs: an autoscaled load balancer or a Kubernetes ingress presents whichever
+ * pod address it happens to have, so enumerating them is impossible and the alternative is trusting
+ * nothing and losing every forwarded header.
+ *
+ * A block widens what may speak for a client, so it must cover ONLY hops you operate — never a subnet
+ * that also holds untrusted workloads, because anything inside it can then assert its own requester_ip,
+ * pass the SCIM TLS gate over plaintext, and satisfy the /mcp host check. Prefer the narrowest prefix
+ * that covers the edge.
+ *
+ * A malformed entry matches nothing rather than throwing or matching everything: a typo must fail
+ * closed. [Config] logs the rejected entries at startup so a typo is visible instead of silently
+ * disabling forwarding.
+ */
+internal fun isTrustedEdge(peerAddress: String?, trustedProxies: Set<String>): Boolean {
+    if (peerAddress == null) return false
+    // Literal match first: the common single-edge case costs one set lookup and no parsing.
+    if (peerAddress in trustedProxies) return true
+    val peer = parseIp(peerAddress) ?: return false
+    return trustedProxies.any { entry -> cidrContains(entry, peer) }
+}
+
+/** Parsed only through [InetAddress.getByName]'s literal path — never a DNS lookup, which a peer
+ *  address is not and which would let a hostname entry resolve at match time. */
+private fun parseIp(candidate: String): ByteArray? {
+    val c = candidate.trim().removeSurrounding("[", "]")
+    if (c.isEmpty() || !c.all { it.isDigit() || it == '.' || it == ':' || it in 'a'..'f' || it in 'A'..'F' || it == '%' }) {
+        return null
+    }
+    return runCatching { InetAddress.getByName(c).address }.getOrNull()
+}
+
+/**
+ * True when [peer] falls inside `entry` written as `address/prefixLength`. Compares whole bytes, then
+ * the remaining bits of the boundary byte. A prefix outside `0..bits` or a family mismatch (an IPv4
+ * peer against an IPv6 block) is not a match — the two address spaces are compared, never coerced.
+ */
+private fun cidrContains(entry: String, peer: ByteArray): Boolean {
+    val slash = entry.indexOf('/')
+    if (slash < 0) return false
+    val block = parseIp(entry.substring(0, slash)) ?: return false
+    if (block.size != peer.size) return false
+    val prefix = entry.substring(slash + 1).trim().toIntOrNull() ?: return false
+    val bits = block.size * 8
+    if (prefix < 0 || prefix > bits) return false
+    val fullBytes = prefix / 8
+    for (i in 0 until fullBytes) if (block[i] != peer[i]) return false
+    val remaining = prefix % 8
+    if (remaining == 0) return true
+    val mask = (0xFF shl (8 - remaining)) and 0xFF
+    return (block[fullBytes].toInt() and mask) == (peer[fullBytes].toInt() and mask)
+}
+
+/**
+ * The entries [isTrustedEdge] could never match: not a literal address and not a parseable CIDR block.
+ * Config logs these at startup — a malformed entry fails closed, and failing closed silently is how a
+ * typo turns into "forwarded headers stopped working" with nothing pointing at the cause.
+ */
+internal fun unusableTrustedProxyEntries(trustedProxies: Set<String>): List<String> =
+    trustedProxies.filter { entry ->
+        if (entry.contains('/')) {
+            val slash = entry.indexOf('/')
+            val addr = parseIp(entry.substring(0, slash))
+            val prefix = entry.substring(slash + 1).trim().toIntOrNull()
+            addr == null || prefix == null || prefix < 0 || prefix > addr.size * 8
+        } else {
+            parseIp(entry) == null
+        }
+    }
+
+internal fun resolveHttpRequesterIp(peerAddress: String?, xff: String?, trustedProxies: Set<String>): String? {
+    // The SAME cedar-java parse AuthzContext.toCedarMap uses for `requester_ip` (Authz.kt) is the ONE
+    // definition of "valid IP" for the whole control-plane, so this resolver and the eventual Cedar
+    // marshalling can never disagree about what counts as a well-formed address. A stripped-but-still-bogus
+    // candidate resolves to null here.
+    fun validate(bare: String?): String? = bare?.takeIf { runCatching { IpAddress(it) }.isSuccess }
+
+    if (isTrustedEdge(peerAddress, trustedProxies)) {
+        // The socket peer is a configured trusted edge — its OWN address is the edge, NOT the end requester, so
+        // it must NEVER be used as requester_ip. The client only appears in X-Forwarded-For; take the RIGHTMOST
+        // entry (the one THIS edge appended — everything to its left is client-supplied and unattested). A
+        // missing, blank, or malformed rightmost entry resolves to null: requester_ip goes absent (fail-closed),
+        // never the edge's own address and never a client-forgeable value.
+        if (xff.isNullOrBlank()) return null
+        return validate(stripToBareIp(xff.split(',').last().trim()))
+    }
+    // The socket peer is a DIRECT client (not a configured edge): the TCP-level peer IS the requester (a fact of
+    // the connection, unspoofable), and any X-Forwarded-For it sends is client-forgeable and ignored. An
+    // absent/unparseable peer resolves to null.
+    return validate(stripToBareIp(peerAddress))
+}
+
+/**
+ * The authority (`host` or `host:port`) the CLIENT addressed, for the checks that compare a request's
+ * target against a configured public identity — today the `/mcp` host check (McpServer.kt).
+ *
+ * Direct `Host` is a fact of the request. `X-Forwarded-Host` is client-settable, so it is honored ONLY
+ * when the socket peer is a configured trusted edge — [isTrustedEdge], the same
+ * server-attested-never-client-asserted invariant [resolveHttpRequesterIp] enforces for
+ * `X-Forwarded-For` and [resolveScimTls] for `X-Forwarded-Proto`. Without that gate the host check
+ * would be bypassable by asserting a header, which is the DNS-rebinding defense it exists to provide.
+ *
+ * A multi-hop value takes the RIGHTMOST entry — the one THIS edge appended; everything left of it is
+ * client-supplied. `X-Forwarded-Host` may itself carry a port; when it does not, [forwardedPort]
+ * supplies one, so an edge that splits authority across the two headers still resolves correctly.
+ * Falls back to the direct authority whenever the peer is untrusted or the header is absent/blank, so
+ * a deployment with no edge behaves exactly as before.
+ */
+internal fun resolveForwardedAuthority(
+    directHost: String,
+    directPort: Int,
+    peerAddress: String?,
+    forwardedHost: String?,
+    forwardedPort: String?,
+    trustedProxies: Set<String>,
+): Pair<String, Int?> {
+    val direct = directHost to directPort
+    if (!isTrustedEdge(peerAddress, trustedProxies)) return direct
+    val asserted = forwardedHost?.split(',')?.lastOrNull()?.trim()?.takeIf { it.isNotEmpty() } ?: return direct
+    // An IPv6 literal authority is bracketed (`[::1]:443`), so only split a port off the LAST colon and
+    // only when it follows the closing bracket — otherwise `[::1]` would be shredded at its first colon.
+    val lastColon = asserted.lastIndexOf(':')
+    val hasPort = lastColon > asserted.lastIndexOf(']') &&
+        lastColon < asserted.length - 1 &&
+        asserted.drop(lastColon + 1).all(Char::isDigit)
+    val host = if (hasPort) asserted.take(lastColon) else asserted
+    val portFromHost = if (hasPort) asserted.drop(lastColon + 1).toIntOrNull() else null
+    val port = portFromHost
+        ?: forwardedPort?.split(',')?.lastOrNull()?.trim()?.toIntOrNull()
+    return host.removeSurrounding("[", "]") to port
+}
+
+/**
+ * Strip a bare address out of an XFF/peer candidate that may carry a port, STRICTLY. Unlike the wire path's
+ * [parseRequesterIp] (which parses Netty's always-well-formed `SocketAddress.toString()`), an XFF entry is
+ * attacker-adjacent, so a malformed candidate must resolve to `null`, never be salvaged into a valid-looking IP:
+ *  - `[v6]` / `[v6]:port` — a closing bracket is REQUIRED, and any suffix after `]` must be exactly `:<digits>`
+ *    (so `[203.0.113.5` and `[203.0.113.5]junk` are rejected, not silently truncated to a valid IP);
+ *  - `host:port` (a single colon) — the port must be all digits (so `203.0.113.5:not-a-port` is rejected,
+ *    not accepted as a bare IPv4);
+ *  - anything else is a bare address (bare IPv4, or bare IPv6 whose multiple colons aren't a port).
+ * The result is only a CANDIDATE — [resolveHttpRequesterIp] still validates it through cedar-java's [IpAddress]
+ * (the one definition of "valid IP"), so a stripped-but-still-bogus host resolves to null there.
+ */
+private fun stripToBareIp(candidate: String?): String? {
+    val c = candidate?.trim()?.removePrefix("/")?.takeIf { it.isNotEmpty() } ?: return null
+    val host = when {
+        c.startsWith("[") -> {
+            val close = c.indexOf(']')
+            if (close < 0) return null
+            val suffix = c.substring(close + 1)
+            if (suffix.isNotEmpty() && !(suffix.startsWith(":") && suffix.length > 1 && suffix.drop(1).all(Char::isDigit))) {
+                return null
+            }
+            c.substring(1, close)
+        }
+        c.count { it == ':' } == 1 -> {
+            val port = c.substringAfter(':')
+            if (port.isEmpty() || !port.all(Char::isDigit)) return null
+            c.substringBefore(':')
+        }
+        else -> c
+    }
+    return host.takeIf { it.isNotEmpty() }
+}
+
+/**
+ * The HTTP entry point's resolved requester IP — trusted-edge-gated per
+ * [resolveHttpRequesterIp]. `request.local.remoteAddress` is the raw socket peer Ktor's Netty engine reports;
+ * no `ForwardedHeaders`/`XForwardedHeaders` plugin is installed (App.kt), so nothing upstream of this call
+ * has already substituted a client-asserted value — the peer really is the TCP-level fact this resolver needs.
+ */
+internal fun ApplicationCall.httpRequesterIp(config: Config): String? {
+    val peer = request.local.remoteAddress
+    val xff = request.headers.getAll("X-Forwarded-For")?.lastOrNull()
+    return resolveHttpRequesterIp(peer, xff, config.trustedProxies)
+}
+
+/**
+ * The non-query [AuthzContext] for an HTTP admin/audit/approval route: only `requesterIp` is
+ * populated here — `channel` is deliberately left unset (these routes have no query-decision channel, and
+ * inventing one would be dishonest; see [com.ridi.oss.proxymonster.controlplane.authz.authorizeWithContext]
+ * for the datasource-scoped tag derivation these routes layer on top when a datasource is in scope).
+ */
+internal fun ApplicationCall.httpAuthzContext(config: Config): AuthzContext =
+    AuthzContext(requesterIp = httpRequesterIp(config))

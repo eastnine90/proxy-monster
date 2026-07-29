@@ -1,0 +1,27 @@
+{
+  "displaced": {
+    "title": "You were signed in on another device",
+    "body": "This session ended because a newer sign-in replaced it.",
+    "signInAgain": "Sign in again"
+  },
+  "idleWarn": {
+    "title": "Your session will end soon",
+    "body": "Continue working to keep this session active."
+  },
+  "absoluteWarn": {
+    "title": "Re-authentication required soon",
+    "body": "Sessions require a new sign-in every {amount, plural, one {# {unit, select, hours {hour} minutes {minute} seconds {second} other {unit}}} other {# {unit, select, hours {hours} minutes {minutes} seconds {seconds} other {units}}}}.",
+    "relogin": "Re-authenticate"
+  },
+  "countdown": {
+    "label": "Session remaining",
+    "hoursMinutes": "{hours}h {minutes}m",
+    "hours": "{hours}h",
+    "minutes": "{minutes}m"
+  },
+  "reauthNow": "Re-authenticate now",
+  "reauthComplete": {
+    "title": "Re-authentication complete",
+    "body": "You can close this window and continue your work."
+  }
+}

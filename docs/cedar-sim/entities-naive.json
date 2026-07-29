@@ -1,0 +1,47 @@
+[
+  { "uid": { "type": "User", "id": "requester" }, "attrs": {}, "parents": [] },
+  { "uid": { "type": "User", "id": "other" }, "attrs": {}, "parents": [] },
+  {
+    "uid": { "type": "Request", "id": "req1" },
+    "attrs": {
+      "approved": true,
+      "requester": { "__entity": { "type": "User", "id": "requester" } }
+    },
+    "parents": []
+  },
+  {
+    "uid": { "type": "Request", "id": "req2" },
+    "attrs": {
+      "approved": false,
+      "requester": { "__entity": { "type": "User", "id": "requester" } }
+    },
+    "parents": []
+  },
+  {
+    "uid": { "type": "ResultColumn", "id": "req1-rrn" },
+    "attrs": {
+      "request": { "__entity": { "type": "Request", "id": "req1" } },
+      "unmaskable": true,
+      "requiredZone": "segregated"
+    },
+    "parents": []
+  },
+  {
+    "uid": { "type": "ResultColumn", "id": "req1-name" },
+    "attrs": {
+      "request": { "__entity": { "type": "Request", "id": "req1" } },
+      "unmaskable": true,
+      "requiredZone": ""
+    },
+    "parents": []
+  },
+  {
+    "uid": { "type": "ResultColumn", "id": "req2-rrn" },
+    "attrs": {
+      "request": { "__entity": { "type": "Request", "id": "req2" } },
+      "unmaskable": true,
+      "requiredZone": "segregated"
+    },
+    "parents": []
+  }
+]

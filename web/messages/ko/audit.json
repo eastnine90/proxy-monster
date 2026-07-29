@@ -1,0 +1,57 @@
+{
+  "log": {
+    "title": "감사 로그",
+    "subtitleMine": "내 판정만 표시 — 최신순.",
+    "subtitleAll": "실시간 판정 피드 — 최신순."
+  },
+  "live": {
+    "live": "실시간",
+    "paused": "일시정지",
+    "toggle": "실시간 폴링 전환"
+  },
+  "filter": {
+    "allDecisions": "모든 판정",
+    "all": "전체",
+    "searchPlaceholder": "Principal 또는 SQL 검색…"
+  },
+  "empty": {
+    "noMatchTitle": "현재 필터에 해당하는 판정이 없습니다.",
+    "noMatchHint": "판정 필터를 넓히거나 검색어를 지워 보세요.",
+    "noneTitle": "아직 판정이 없습니다 — 에디터에서 쿼리를 실행해 보세요.",
+    "noneHint": "프록시가 쿼리를 평가하면 여기에 판정이 표시됩니다."
+  },
+  "sheet": {
+    "title": "판정 상세",
+    "description": "선택한 시행 판정의 전체 상세 정보입니다.",
+    "permalink": "영구 링크",
+    "requestApproval": "승인 요청"
+  },
+  "permalink": {
+    "title": "감사 판정 #{id}",
+    "subtitle": "감사된 시행 판정 하나에 대한 영구 링크입니다.",
+    "back": "감사 로그로 돌아가기",
+    "loading": "판정을 불러오는 중…",
+    "requestApproval": "승인 요청"
+  },
+  "detail": {
+    "failedStage": "실패 단계",
+    "principal": "Principal",
+    "clientAddress": "클라이언트 주소",
+    "roles": "역할",
+    "sql": "SQL",
+    "piiTouched": "접근한 PII",
+    "maskedColumns": "마스킹된 컬럼",
+    "latency": "지연 시간"
+  },
+  "row": {
+    "pii": "{count} PII",
+    "masked": "{count} 마스킹"
+  },
+  "relativeTime": {
+    "justNow": "방금 전",
+    "secondsAgo": "{count}초 전",
+    "minutesAgo": "{count}분 전",
+    "hoursAgo": "{count}시간 전",
+    "daysAgo": "{count}일 전"
+  }
+}

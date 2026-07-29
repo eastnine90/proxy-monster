@@ -1,0 +1,10 @@
+go 1.23.12
+
+use (
+	./analyzer
+	./auditmon
+	./goproxy
+	./mysqlwire
+	./pmon
+	./pmontray
+)

@@ -1,0 +1,27 @@
+{
+  "displaced": {
+    "title": "다른 기기에서 로그인되었습니다",
+    "body": "새로운 로그인으로 교체되어 이 세션이 종료되었습니다.",
+    "signInAgain": "다시 로그인"
+  },
+  "idleWarn": {
+    "title": "세션이 곧 종료됩니다",
+    "body": "계속 작업하면 세션이 활성 상태로 유지됩니다."
+  },
+  "absoluteWarn": {
+    "title": "곧 재인증이 필요합니다",
+    "body": "세션은 {amount}{unit, select, hours {시간} minutes {분} seconds {초} other {}}마다 다시 로그인해야 합니다.",
+    "relogin": "재인증"
+  },
+  "countdown": {
+    "label": "세션 남은 시간",
+    "hoursMinutes": "{hours}시간 {minutes}분",
+    "hours": "{hours}시간",
+    "minutes": "{minutes}분"
+  },
+  "reauthNow": "지금 재인증",
+  "reauthComplete": {
+    "title": "재인증이 완료되었습니다",
+    "body": "이 창을 닫고 작업을 계속할 수 있습니다."
+  }
+}

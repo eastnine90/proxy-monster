@@ -1,0 +1,5 @@
+# Review is requested from the maintainers on every pull request.
+#
+# proxy-monster is an access-control proxy: a change to enforcement, policy, or the
+# wire path can turn a DENY into an ALLOW, so nothing merges unreviewed.
+* @ridi-oss/proxy-monster-maintainers

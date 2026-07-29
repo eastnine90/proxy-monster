@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/ridi-oss/proxy-monster/security/advisories/new
+    about: >-
+      proxy-monster sits inline between clients and sensitive data. Report
+      vulnerabilities through GitHub private vulnerability reporting — never as
+      a public issue, pull request, or discussion. A query that returns an
+      unmasked value it should not, or that runs where it should have been
+      denied, belongs here.

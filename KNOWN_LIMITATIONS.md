@@ -1,0 +1,495 @@
+# Known limitations
+
+A single register of proxy-monster's known limitations, accepted caveats, and
+deferred gaps — what the system does not guarantee, where it deliberately
+over-denies, and what's tracked for later. This is the one place to look;
+detailed design/tracking lives in the linked docs.
+
+Severity legend: 🟢 fail-safe over-deny (a legitimate query may DENY, never a
+wrong-ALLOW) · 🟡 fail-closed deny of a legitimate case (feature intentionally
+unavailable) · 🔴 known disclosure/leak (not fail-safe — a real gap).
+
+The overriding invariant is fail-closed: a cleartext PII leak is the worst
+outcome, over-denying is acceptable. Everything below is consistent with that
+except the items explicitly marked 🔴.
+
+Every engine, MySQL, and PostgreSQL mention below is about a **target database**
+— what the proxy protects and enforces against. None of it concerns the
+control-plane store, which is PostgreSQL only and carries no portability caveat
+([`docs/migrations.md`](./docs/migrations.md)).
+
+## Web session lifecycle
+
+- A web session without a stored refresh token cannot be revalidated against the
+  IdP mid-session. This occurs when `offline_access` is absent or
+  `PM_RESULT_KEY` is unset. The timer sweep leaves that session alone; identity
+  staleness is bounded by the configured absolute cap
+  (`PM_WEB_SESSION_ABSOLUTE`, default 2h), not the 5-minute IdP recheck
+  interval.
+- proxy-monster is a single-instance system. Timer-sweep serialization,
+  refresh-token use, migrations, and runtime guards assume one control-plane
+  process. Multi-replica coordination and leader election are out of scope by
+  design; do not deploy multiple active replicas.
+- Okta's groups claim must be configured for refresh-grant id-tokens. A groups
+  claim can be present in the initial id-token yet be dropped from refreshed
+  id-tokens when its claim filter is configured as Userinfo/id_token request.
+  You MUST configure the filter as Always, then empirically verify that
+  refreshed id-tokens retain `groups` and reflect current membership. A missing
+  `groups` claim on refresh is treated as an empty set (full group removal). The
+  `>100` groups distributed-claim pointer behavior belongs to Azure/Entra, not
+  Okta: Okta fails the token request instead, and that error is transient — it
+  is never interpreted as `invalid_grant` or deactivation.
+- A login-vs-sweep race can briefly mint a zero-role (or just-deactivated) web
+  session. The OIDC callback resolves the principal's roles and then mints the
+  session as two separate steps; if the ≤5-minute liveness sweep reconciles that
+  principal to empty groups (or deactivation) in between, the callback can still
+  mint a live web session whose effective roles are already gone. This is
+  harmless for direct data access and is not fixed by design. Every query and
+  wire-protocol path re-resolves roles server-side and re-checks deactivation,
+  so a zero-role or deactivated principal DENYs and reads nothing. Self-service
+  control-plane actions whose shipped policies do not require a role remain
+  reachable: an active zero-role principal may mint its own token, and
+  `task.request` permits request creation by default. The token still has no
+  effective query access, and deactivated principals cannot mint new tokens. The
+  session self-heals at the next sweep (≤5 min) or, at the latest, the absolute
+  cap (`PM_WEB_SESSION_ABSOLUTE`, default 2h). Accepted under the
+  single-instance topology (the login role check and the sweep are not
+  serialized). Detail: [`docs/session-lifetime.md`](./docs/session-lifetime.md).
+
+## Daemon session renewal and revocation
+
+- 🟡 A `pmon` login is not renewed silently. The control plane serves
+  `POST /auth/session/renew` and `pmon login` stores the renewal token the
+  device-login result returns, but no pmon code path calls that route. A login
+  therefore lasts exactly one wire token TTL (`pmon login --ttl`, default 12h,
+  clamped server-side to 24h) and then needs a fresh `pmon login`.
+  `PM_SESSION_WINDOW` (default 2h) bounds only how long the unused renew route
+  would accept a renewal token; raising it cannot extend a live session.
+- 🔴 Closing a daemon renewal window does not revoke the wire token issued under
+  it. Because the token TTL (12h default) outlives the window (2h default) and
+  the wire path validates only `proxy_token`, a definitive IdP rejection during
+  the liveness sweep — which for a `DAEMON` row only calls `closeDaemonWindow` —
+  leaves that principal's already-issued token authorizing queries until its own
+  TTL expires. It is not a full gap: the sweep's group reconciliation runs
+  first, so a revocation expressed as group removal (or a missing `groups`
+  claim) empties the role set and every subsequent statement DENYs. The exposure
+  is a revocation the IdP signals _only_ as `invalid_grant` while local group
+  membership still maps to roles. The authoritative deprovision path (SCIM
+  `active=false`, local-admin deactivate) has no such gap —
+  `revokeActiveCredentialsTx` revokes the wire tokens outright. Detail:
+  [`docs/auth-model.md`](./docs/auth-model.md#security-invariants).
+
+## Identifier handling (schema-aware enforcement)
+
+- 🟡 Identifiers containing `.` or `/` cannot be authorized normally. Both are
+  legal inside a _quoted_ identifier but are the key/EUID delimiters (analyzer
+  keys join on `.`, Cedar EUIDs on `/`), so a component containing one either
+  fails identity rendering or is denied during Cedar resource binding.
+  Production denies; an explicit `sql.unanalyzable` grant may relay a statement
+  whose dotted identity failed before resource facts were emitted.
+
+## Live namespace tracking
+
+PostgreSQL wire decisions resolve against the connection's probed effective
+`search_path`. MySQL re-probes `DATABASE()`, the connection character sets, and
+`sql_mode` before every statement; prepared execution uses the namespace and
+`ANSI_QUOTES` mode captured at prepare time.
+
+The Go PostgreSQL broker (`goproxy/pgproxy`) uses probe-always: it re-probes the
+effective `search_path` and the session-temp overlay after every completed
+client statement rather than classifying SQL, so a persistent mid-session change
+is picked up by the next statement's probe regardless of how it was made, at the
+cost of one extra probe round-trip per statement. On the extended-query path,
+PostgreSQL resolves and plans a portal under the `search_path` in force at Bind
+(plancache re-resolves a named statement whose path changed after Parse), so the
+broker captures the namespace and temp overlay immediately before forwarding
+each Bind and re-decides every `Execute` against that snapshot — the PostgreSQL
+analog of MySQL's Prepare-time freeze. No control-plane decision is ever stored.
+
+- `COM_INIT_DB` audit boundary. The MySQL database switch is enforced (dirty →
+  re-probe) but is not audited as a statement because it carries no SQL text;
+  the follow-on query's audit records the new effective namespace.
+- `DISCARD` routes through the datasource-wide `sql.unanalyzable` gate. The
+  production posture denies it; a development datasource may relay it.
+- 🟡 First-in-transaction probe injection breaks `SET TRANSACTION` after an
+  opener. Because the namespace probes are injected as ordinary simple queries,
+  they consume a transaction's first-statement slot. Under probe-always, a
+  `SET TRANSACTION …` issued as the first statement after `BEGIN` /
+  `START TRANSACTION` (or a `COMMIT AND CHAIN` / `ROLLBACK AND CHAIN` opener)
+  hits the injected probe and fails with SQLSTATE 25001
+  (`SET TRANSACTION must be called before any query`). Suppressing the probe for
+  a "bare opener" would need either SQL classification or a wire-signature guess
+  — both rejected (the latter is a fail-open: a stored `CALL` can mimic the
+  bare-opener wire signature while moving `search_path`). Strictly fail-safe: an
+  extra probe, never a skipped one — no leak; a client that needs a non-default
+  isolation level should use `BEGIN ISOLATION LEVEL …` instead of a separate
+  `SET TRANSACTION`.
+- 🟡 `client_encoding` must remain UTF8. The engine and control plane read the
+  client's SQL bytes as UTF-8 to resolve identifiers. A backend session that
+  switches `client_encoding` to another encoding would let the same bytes bind
+  different objects on each side (a non-ASCII identifier could dodge its
+  mask/deny — verified against real PostgreSQL). `client_encoding` is
+  `GUC_REPORT`, so the change is observed before the next statement runs and the
+  relay fails closed; a client that needs a non-UTF8 session encoding is refused
+  rather than served with a binding-confusion hole.
+- 🟡 `standard_conforming_strings` must remain on. The control-plane admission
+  lexer parses string literals assuming standard-conforming strings; with it
+  off, PostgreSQL's backslash-escape parsing lets a crafted literal hide a
+  statement boundary the lexer cannot see (a multi-statement slip — verified
+  against real PostgreSQL). It is `GUC_REPORT`, so a session turning it off is
+  observed and the relay fails closed (SQLSTATE `0A000`) rather than proxying
+  under a divergent lexer.
+- 🔴 `search_path` mutated _inside_ Bind parameter coercion is untracked
+  (extended path). The bind-time capture probes the namespace immediately before
+  forwarding `Bind`, but `Bind` itself runs parameter input/coercion (input
+  functions, domain `CHECK`s) _before_ it plans the portal. A crafted domain
+  whose check calls `set_config('search_path', <bound value>, false)` moves the
+  path during `Bind`, so the portal resolves under a path the pre-`Bind` probe
+  never saw, and the `Execute` re-decide authorizes under the stale snapshot (a
+  wrong-ALLOW). Reproduced against PG16 by
+  `pgproxy.TestExtendedBindCoercionSetConfigLeaksAcrossSchema` (the proxy
+  decides under the primary path yet the backend returns the secondary schema's
+  row). The offending domain must already exist, which needs a
+  `CREATE DOMAIN`/`CREATE FUNCTION` grant the masking policy denies read-only
+  principals. A fail-safe close (re-probe _after_ Bind, or bind under a pinned
+  `search_path`) is a follow-up. Tracked:
+  [`docs/backlog.md`](./docs/backlog.md).
+
+## Catalog freshness
+
+Enforcement decides against a per-connection catalog captured on the
+connection's own held backend connection (design:
+[`docs/per-connection-catalog.md`](./docs/per-connection-catalog.md)) — the
+control plane always decides against exactly what that connection's backend
+binds. The datasource-global catalog is now config-only (catalog browser,
+tagging, table detail) and never feeds an enforcement decision.
+
+- Enforcement-path residuals (per-connection model; full detail and severities
+  in [`docs/per-connection-catalog.md`](./docs/per-connection-catalog.md)): 🔴
+  rename/redefinition launders name-keyed classifications (admin's
+  responsibility to re-tag); an approval grant not bound to the resolved
+  resource; DDL inside a DML-fired trigger unflagged; a bounded external `A→B→A`
+  hash/columns revert window; 🟡 MySQL temp-table shadowing (invisible to
+  `information_schema`); and, on the experimental PostgreSQL transactional-DDL
+  path, held-connection-probe edges. `CALL`/routine after-refetch is
+  unreachable: the analyzer emits an unspecified datasource grant for `CALL`,
+  which the control plane denies before execution, so the `after_statement`
+  refetch — which only rides an ALLOW/MASK verdict — never fires; a denied
+  `CALL` doesn't run, so not a leak. A closed/forged `connection_id` can be
+  resurrected by Decide's restart-recovery (no tombstone / mint-evidence to
+  distinguish a closed or forged id from a genuine post-restart id; no
+  cross-principal escalation — recovery binds to the re-validated token's
+  principal). The one time-bounded residual is external / out-of-band DDL — a
+  change made outside the proxy is corrected on the next re-check past the
+  staleness bound, not immediately.
+- 🟡 Config-catalog PushCatalog ordering across replicas (bounded, self-healing)
+  — CONFIG path only. With gRPC self-registration
+  ([`docs/datasource-registration.md`](./docs/datasource-registration.md)) each
+  proxy replica introspects + PushCatalogs the datasource-global config catalog
+  independently; across replicas an older capture can briefly regress the stored
+  config catalog (self-heals on the ~12-min ambient re-push + admin Refresh).
+  This affects only config surfaces — enforcement is per-connection and
+  unaffected. A `db_name` retarget invalidates the config catalog fail-closed;
+  an engine change is rejected; host is advisory.
+- 🟡 A UDF that reads a masked/PII column _inside its body_ — never as a visible
+  argument — returns it in the clear; only _known-dangerous_ functions are
+  classified. The control-plane function gate always forbids `system:critical`;
+  `system:data-leak` is forbidden on the production posture but relaxed on
+  `system:development`. `BaselineDangerousFunctions` supplies a
+  version-independent floor; every unclassified function in a FROM-backed query
+  — a safe builtin or a user-defined function — passes the function gate.
+  Passing a masked/PII column as a visible argument is still caught by the core
+  lineage: a transforming projection like `SELECT custom_udf(ssn)` traces `ssn`
+  as a derived output, and an arbitrary `custom_udf` is not on the
+  provably-total redaction whitelist, so it is DENIED
+  ([`docs/derived-masking.md`](./docs/derived-masking.md)) — only a
+  provably-total builtin string transform (`upper`/`substr`/`concat`/…) is
+  redacted in full (kind NULL); a direct projection `SELECT ssn` is masked with
+  the column's kind; a masked column in a row-shaping position
+  (predicate/join/order/group/distinct) still DENYs. So none of these paths
+  leak. The residual gap is a function body that reads a masked/PII column
+  internally, on the backend service-account connection unseen by the proxy,
+  when that column never appears as an argument: `SELECT my_udf(id) FROM t`,
+  where `id` is not sensitive and `my_udf` internally reads `rrn`, returns `rrn`
+  in the clear. Operational rule: a UDF on a masking datasource must not read
+  PII / masked columns — a "pure" UDF that only transforms its arguments (reads
+  no data) is safe; keeping a data-reading UDF clean is an admin responsibility.
+  Acceptable for the same reason the rename residual above is: creating a
+  function is access-controlled `sql.ddl` a restricted principal can't run, so
+  functions are admin-authored — a masked principal can't introduce a leaking
+  one. Auto-closing it (deny data-reading UDF output unless vouched,
+  auto-clearing declared-no-data functions) is out of scope; the concept is
+  backlogged low priority ([`docs/backlog.md`](./docs/backlog.md)), to be
+  designed when needed.
+
+## Query coverage
+
+- 🟢 sqlglot-go parser gaps route through `sql.unanalyzable`. The production
+  posture denies them; an explicit development exception may relay them
+  verbatim. Parser coverage includes `JSON_TABLE` / `LATERAL VALUES` /
+  `SIMILAR TO`, MySQL `MATCH … AGAINST` / `GROUP_CONCAT(… SEPARATOR …)`, MySQL
+  `INSERT … SET` / `REPLACE`, and structural PostgreSQL `EXPLAIN`. The MySQL
+  write forms use the ordinary `Insert` shape and are analyzable through the
+  proxy's INSERT conservation paths; `REPLACE` still emits an unspecified
+  datasource action and is denied. Bare `SELECT *` over a table-function /
+  `LATERAL` / `VALUES` source is unresolved and follows the same
+  `sql.unanalyzable` gate; that is a masking/lineage limitation, not a parse
+  gap.
+- 🟡 `EXPLAIN` of a query that requires masking is deliberately denied. The
+  analyzer emits the wrapped query's grants with `explain_of_query=true`, so an
+  unmasked inner query may proceed after its ordinary grants pass. If the
+  resulting verdict would be MASK, `decideQuery` denies with
+  `EXPLAIN_MASK_DENY`; this also covers `EXPLAIN ANALYZE`.
+- 🟢 Zero-column table scans require a table grant. A query that names no column
+  of a table — `SELECT count(*) FROM t`, `SELECT 1 FROM t`,
+  `EXISTS(SELECT 1 FROM t)`, a cross-join side that only multiplies cardinality
+  — emits every scanned physical relation as `StatementFacts.sources` from the
+  analyzer's resolution report (a shadowed CTE emits nothing; a CTE body that
+  reads the real table does) and requires `result.read.unmasked` or
+  `result.read.masked` on every uncovered scan (`Authz.authorizeTables`), DENY
+  otherwise. Coverage is per table: a table with any traced column fact is
+  already exposed through that column, so it needs no separate table grant; only
+  a table with zero traced columns and no table grant is denied. Verified on
+  PostgreSQL (`KnownGapsTest`) and MySQL (`ScannedTableMySqlTest`).
+- 🔴 Utility-command passthrough is still an existence oracle. Analyzer-path
+  (`ANALYZED`-class) zero-column scans are covered above, but utility commands
+  that classify as passthrough and take a table target — e.g. `ANALYZE <table>`
+  (PostgreSQL, `SESSION` → wire/editor passthrough, gated only by
+  `datasource.connect`, not a table grant) — still disclose an ungranted table's
+  existence via a backend error. They return no rows. The fix routes each
+  resource-bearing utility to a Cedar gate instead of the blanket passthrough
+  ([`docs/facts-emission.md`](./docs/facts-emission.md)).
+
+## Authz / policy
+
+- 🔴 Role-approval `Request` EUID is not request-unique.
+  `Request::"<requester>#<datasource>"` omits the request id and requested role,
+  so one approval policy authorizes every later request that principal makes for
+  that datasource — a wrong-ALLOW. Tracked in
+  [`docs/backlog.md`](./docs/backlog.md).
+- 🔴 `system:admin` immutability assumes single-instance, migrate-before-serve.
+  The `system:admin` group is immutable through the API and SCIM via runtime
+  guards inside `UserGroupStore`, which are in-process: they serialize
+  concurrent writers within one control plane, not across a fleet. Flyway's
+  migration lock serializes only _migrators_, not live API traffic. Under a
+  rolling multi-instance deploy an old instance still serving could interleave a
+  SCIM PUT with a future migration that rewrites the system row and re-open the
+  admin escalation the guards close. Inert under the current topology (single
+  control-plane instance, `Main.kt` migrates before opening the port). Must be
+  hardened — fleet-stopped migration or `source`-predicated transactional writes
+  on the system row — before enabling any rolling/multi-instance deployment.
+  Tracked: [`docs/backlog.md`](./docs/backlog.md).
+- 🟡 A saved result is fixed to the executor's masking — a more-trusted viewer
+  cannot widen it. A saved workflow result is stored as R's execution-enforced
+  output: masked per exactly `{R}` in the executor's context, encrypted at rest.
+  Viewing re-decides under `{R}` in the viewer's live context, which can mask a
+  column further where that context is more restrictive, but can never reveal a
+  column the execution masked — there is no re-widening beyond what was stored.
+  So a viewer whose context is _more_ trusted than the executor's (e.g. the
+  executor ran off-network, the viewer reads from a 망분리 node) sees the
+  executor's masking, not their own potential unmasking: a column the run masked
+  stays masked. Choose the execution context deliberately — it sets the widest
+  form any later view can show. Detail:
+  [`docs/task-execution.md`](./docs/task-execution.md),
+  [`docs/authz-context.md`](./docs/authz-context.md).
+- 🔴 A saved result's view re-decision is not bound to the execution's namespace
+  or physical lineage. `decideResultView` re-analyzes the task's stored SQL
+  against the current per-datasource catalog and cross-checks the stored bytes
+  against the live verdict only by output-column name equality — it does not pin
+  the namespace (search_path / default schema) or the schema-qualified physical
+  lineage the execution resolved against. If the schema resolution changes
+  between execution and view — an admin re-points the datasource default schema,
+  or a migration shadows the table so the same unqualified SQL resolves to a
+  different physical column bearing the same output name — the stored cleartext
+  bytes (produced for column A) can be released under a mask plan computed for
+  column B. Example: `SELECT rrn FROM users` executed with `users` resolving to
+  a PII `rrn` in schema A, then viewed after the default schema moves to a
+  non-PII `users.rrn` in schema B — the view unmasks (schema B is non-PII), the
+  output name `rrn` matches, and schema A's PII is released. The fix is saved
+  lineage: persist the execution namespace + physical lineage per result child
+  and re-decide pinned to it, so output-name equality stops being the
+  confidentiality boundary. Tracked as a high-priority follow-up in
+  [`docs/backlog.md`](./docs/backlog.md). Detail:
+  [`docs/task-execution.md`](./docs/task-execution.md),
+  [`docs/approval-workflow.md`](./docs/approval-workflow.md).
+- 🟡 Run-as-approver checks the approver's active status at execute, not the
+  requester's (unresolved). An approved query is executed as the approver
+  (`run(principal = executor)`, with the approver pinned as the executor by the
+  approver=executor gate). So the identity whose deprovision/deactivation status
+  governs whether the run proceeds at `/execute` is the approver's, not the
+  requester's: a requester who is deprovisioned _after_ their task is approved
+  still has that task execute when an active approver runs it. The requester
+  remains blocked from viewing the result — `/result` gates the viewer through
+  the `isDeactivated` deprovisioning check — so a deprovisioned requester never
+  reads the rows; the open question is only whether their already-approved task
+  should still _run_ at all. Whether this is a genuine limitation or the
+  intended behavior (the approver, not the requester, is accountable for the
+  run) is unresolved — flagged here rather than silently decided. Detail:
+  [`docs/task-execution.md`](./docs/task-execution.md).
+- 🟡 Open presets — curation is load-bearing. Under `system:development` (and
+  the permit-by-default system posture), a data-reading system object that the
+  shipped `system:` classification _forgets to tag_ is exposed. The curated
+  classification must be thorough + version-maintained. Detail:
+  [`docs/access-model.md`](./docs/access-model.md).
+
+## System classification (`system:` facts — [`docs/system-classification.md`](./docs/system-classification.md))
+
+The runtime classification core is shipped (bundled manifests → `system:` tag →
+the shipped forbids/permit). Two completeness/curation surfaces are deferred —
+they refine the "Open presets" caveat above:
+
+- 🟡→🔴 No fail-closed manifest-completeness guard (defense-in-depth). A touched
+  system table with no governing manifest gets _no_ `system:` tag — not a hard
+  DENY. With only per-resource read grants it stays deny-by-default (🟡,
+  fail-safe); but no _unconditional_ forbid closes an un-manifested system
+  schema, so a datasource-wide read grant or a `system:development` permit
+  _could_ read it (🔴, config-dependent). Deferred —
+  [`docs/backlog.md`](./docs/backlog.md).
+- 🟡 No per-version golden inventory + release-diff gate. Only the manifests
+  (the classification _rules_) ship — there's no committed snapshot of each
+  engine version's system objects and no CI diff against the live catalog, so a
+  manifest can silently fall behind a new engine minor that adds a dangerous
+  object. Deferred — [`docs/backlog.md`](./docs/backlog.md).
+- 🟢 The catalog API doesn't surface computed `system:` tags (display gap, not
+  enforcement). The shipped `system:` tags are computed on the fly by
+  `SystemClassificationService` from the bundled manifests (keyed by the
+  datasource's engine version); they are not stored per column.
+  `DatasourceStore.catalog` returns `CatalogColumn` with only the user-authored
+  `classification` (a `LEFT JOIN` on `column_classification`), so the catalog
+  browser shows user tags but never the shipped ones — e.g. it won't show that
+  `pg_catalog.pg_authid` is `system:critical` per the manifest, only that it's
+  an unclassified column. Enforcement is unaffected (it resolves the tags at
+  decision time); this is purely observability/UX. To fix, resolve each
+  system-schema column through `SystemClassificationService` when building the
+  catalog response and annotate it (tag + `source=shipped` + manifest version).
+  Deferred — [`docs/backlog.md`](./docs/backlog.md).
+
+(Not limitations: reserved-`system:`-tag writes are rejected at classification
+write time; the loaded manifest set + each datasource's resolved manifest are
+logged at boot / proxy catalog-push.)
+
+## Data plane
+
+- 🟡 Unmaskable paths are fail-closed. PostgreSQL `COPY` and function-call
+  fast-path have no relay and are always denied. MySQL binary/prepared results
+  and PostgreSQL binary-format results cannot be masked; they deny by default,
+  but a MASK verdict carrying `unmaskable_permitted` may relay them unmasked
+  when `sql.unmaskable` is granted. Detail:
+  [`docs/access-model.md`](./docs/access-model.md).
+
+## Wire-cert distribution (direct clients and `pmon`)
+
+A proxy with wire TLS advertises the certificate CHAIN a client should trust at
+`Register` — PEM, leaf first, plus any intermediates and root. The control plane
+stores it on the datasource row, `GET /api/datasources` surfaces it, and
+`GET /api/datasources/{id}/wire-cert` serves it as a file for `psql`, `mysql`,
+and DataGrip (`sslrootcert` / `--ssl-ca` with `verify-full`). `pmon` uses the
+same bytes as the root pool for its upstream hop with the advertised host
+checked, so there is one trust mechanism rather than a separate pinning path.
+Registration also carries `advertise_wire_tls`, a separate boolean saying
+whether the proxy serves TLS at all: `pmon` refuses to send the token to a proxy
+that offers no TLS whenever that is set. `pmon` brokers MySQL only, so a
+PostgreSQL client verifies with the downloaded file instead.
+
+- 🔴 The advertised chain's root of trust is the `Register` credential, not a
+  proxy identity. One system-wide shared secret (`PM_SECRET_TOKEN`)
+  authenticates every proxy RPC and `Register` accepts a caller-asserted
+  datasource name, so whoever holds that secret — or anyone who can reach the
+  gRPC port while it is unset, which starts the gate open — can re-register any
+  datasource's advertised address and chain, serve a matching cert, and capture
+  that datasource's wire tokens. The fix is a datasource-bound registrar
+  identity (a per-datasource register credential, proxy mTLS bound to the
+  permitted name, or an admin-owned trust record), not a change to how the chain
+  is verified. Set `PM_SECRET_TOKEN` on the control plane and every proxy:
+  startup does not require it today, and [`docs/backlog.md`](./docs/backlog.md)
+  tracks failing startup when it is unset in production. Trust boundary:
+  [`docs/datasource-registration.md`](./docs/datasource-registration.md).
+- 🟡 Every certificate in the advertised file becomes a trust anchor for `pmon`,
+  including the leaf: it loads the whole PEM into a Go root pool, and Go trusts
+  a certificate found directly in that pool. So a bundle contaminated with an
+  unrelated CA widens trust rather than failing closed — anyone able to obtain a
+  certificate for the advertised hostname from that CA could impersonate the
+  proxy. The control plane inspects the chain at registration and warns when it
+  cannot verify a path through it, but by design it stores and serves the
+  material anyway: refusing would mean the datasource is never created, so no
+  catalog is pushed and every decision fails closed — a total outage in place of
+  one client's TLS error. Publish only the certificates the proxy actually
+  presents. Narrowing the served file to the verified path is tracked in
+  [`docs/backlog.md`](./docs/backlog.md).
+- 🟡 Chain verification is not strictly stronger than the leaf pinning it
+  replaced. It gains the hostname binding that pinning had to give up
+  (`InsecureSkipVerify` disabled the hostname check, so a stolen leaf replayed
+  on another host satisfied the pin), but identity widens from one exact leaf to
+  any valid certificate for that name under the advertised anchors. For the
+  common self-signed case those are the same set.
+- 🟡 Certificate expiry is never checked before advertising. An expired leaf is
+  published like any other, and the client reports it. This is deliberate — the
+  client's error is the authoritative one — but it means the console can offer a
+  certificate that no client will accept.
+- 🟡 A rotated cert re-advertises on the proxy's next register, not instantly.
+  The proxy re-reads the chain at every `Register` — at startup and on each
+  Events-stream reconnect resync — and `pmon` re-lists datasources every 30
+  seconds. Between a rotation and both sides converging, handshakes fail closed:
+  an availability cost, never a leak. A file already downloaded for a direct
+  client is invalidated by rotation and has to be downloaded again.
+
+## SQL editor
+
+The web SQL editor executes over the proxy-dialed `RunExec` channel (the
+control-plane never dials the target); its query runs through the proxy's normal
+`Decide`, same as a native-wire client. The interactive editor drives a
+persistent per-session stream (`RunExecService.openSession`/`runOnSession`, the
+`editorSessionRoutes` behind `POST /api/editor/sessions`), holding one backend
+connection so `SET`/`USE`/temp/`BEGIN` persist across queries. The one-shot
+`RunExecService.run` (open → one statement → `Close`) backs the approval-execute
+path and `POST /api/datasources/{id}/query`, not the interactive editor.
+
+- 🟡 Editor statements decide as `Channel.EDITOR`, so `SESSION` statements
+  passthrough-ALLOW. Benign `SET`, `BEGIN`, `USE`, and `ANALYZE` are allowed on
+  the editor channel; classified privileged `SET` forms still pass their Utility
+  gate, and session statements stay denied on the workflow executor/viewer
+  channels. Because a persistent session holds ONE backend connection across
+  MANY statements, a session mutation can affect a later query on the same
+  connection; its safety rests on per-statement re-decide — every statement
+  round-trips to the proxy's `Decide` against that connection's live
+  per-connection catalog, so a mutated namespace is re-authorized rather than
+  carried silently, and a multi-statement `SET; SELECT` batch is rejected at
+  admission so passthrough only ever sees a pure session statement. Hard gate:
+  per-statement re-decide (or an explicit session-mutation refusal) must remain
+  the standing mitigation.
+- 🟡 No concurrent-editor-session cap (auth'd DoS surface). Each open session
+  pins ONE unpooled backend connection on the proxy for the life of its run
+  stream, which `RUN_STREAM_TIMEOUT_MS` caps at 15 minutes. The proxy releases
+  the backend connection when that stream closes; the control plane's stale
+  session entry is removed by an explicit close, a subsequent failed query, or
+  the idle sweep. That sweep has two separate numbers: a 30-minute idle cutoff
+  (`EDITOR_SESSION_MAX_IDLE_MS`) evaluated by the housekeeping loop on its
+  15-minute tick (`RESULT_PURGE_INTERVAL_MS`), so a session is reaped up to ~45
+  minutes after its last use. An authenticated user opening many sessions can
+  still exhaust the target's `max_connections` within that window. Bounded by
+  auth; a per-principal / per-datasource cap is a follow-up.
+- Ephemeral EDITOR token, TTL-bounded not scope-bounded. The control-plane mints
+  an `EDITOR` wire token per session with a generous absolute TTL, revoked on
+  idle sweep, explicit close, or cleanup after a failed query. Neither TTL is a
+  flat constant: both are floors that grow with `PM_QUERY_TIMEOUT` so a token
+  never expires under the statement it authorizes. The editor session token
+  requests max(8h, `PM_QUERY_TIMEOUT` + 120s); the one-shot `run` token — the
+  approval-execute path and `POST /api/datasources/{id}/query` — requests
+  max(300s, `PM_QUERY_TIMEOUT` + 120s), so at the default 600s timeout it is
+  720s, not the 300s floor. `TokenStore.issue` then clamps every request into
+  [60s, 24h], which is the real ceiling on both. A run-stream timeout or
+  canceled HTTP query does not itself revoke it. It is barred from the
+  wire-session handshake (`TokenStore.validate` rejects `kind='EDITOR'`), so a
+  leak can't open a native session; within its TTL it could still drive extra
+  `Decide` calls, but only over the secret-gated control-plane↔proxy channel.
+  Revoked `EDITOR` token rows accumulate with no purge sweep (cosmetic).
+- Untested paths (analyzed-correct): run-stream timeout and Ktor cancellation
+  leave token cleanup to explicit close, the next failed query, or the idle
+  sweep; those cleanup paths are verified by inspection, not dedicated tests
+  (the token TTL is the fail-safe).
+
+---
+
+_Add an entry here whenever a fix ships with an accepted caveat or a deferred
+gap, rather than burying it in a design doc. Keep detail/tracking in the linked
+docs; this file is the index._

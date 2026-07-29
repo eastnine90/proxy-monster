@@ -1,0 +1,18 @@
+{
+  "primaryNavigation": "Primary navigation",
+  "query": "Query",
+  "workflows": "Workflows",
+  "access": "Access",
+  "audit": "Audit",
+  "admin": "Admin",
+  "adminSubtitle": "System configuration",
+  "adminNavLabel": "Admin navigation",
+  "datasources": "Datasources",
+  "policies": "Policies",
+  "users": "Users",
+  "groups": "Groups",
+  "policyRoles": "Roles",
+  "policyAssignments": "Assignments",
+  "policyMaskFns": "Mask functions",
+  "policyCedarPolicies": "Cedar policies"
+}

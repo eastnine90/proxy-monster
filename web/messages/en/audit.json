@@ -1,0 +1,57 @@
+{
+  "log": {
+    "title": "Audit log",
+    "subtitleMine": "Your decisions only — newest first.",
+    "subtitleAll": "Live decision feed — newest first."
+  },
+  "live": {
+    "live": "Live",
+    "paused": "Paused",
+    "toggle": "Toggle live polling"
+  },
+  "filter": {
+    "allDecisions": "All decisions",
+    "all": "All",
+    "searchPlaceholder": "Search principal or SQL…"
+  },
+  "empty": {
+    "noMatchTitle": "No decisions match the current filters.",
+    "noMatchHint": "Broaden the decision filter or clear the search.",
+    "noneTitle": "No decisions yet — run a query in the editor.",
+    "noneHint": "Decisions appear here as the proxy evaluates queries."
+  },
+  "sheet": {
+    "title": "Decision detail",
+    "description": "Full details for the selected enforcement decision.",
+    "permalink": "Permalink",
+    "requestApproval": "Request approval"
+  },
+  "permalink": {
+    "title": "Audit decision #{id}",
+    "subtitle": "Permalink to one audited enforcement decision.",
+    "back": "Back to audit",
+    "loading": "Loading decision…",
+    "requestApproval": "Request approval"
+  },
+  "detail": {
+    "failedStage": "Failed stage",
+    "principal": "Principal",
+    "clientAddress": "Client address",
+    "roles": "Roles",
+    "sql": "SQL",
+    "piiTouched": "PII touched",
+    "maskedColumns": "Masked columns",
+    "latency": "Latency"
+  },
+  "row": {
+    "pii": "{count} PII",
+    "masked": "{count} masked"
+  },
+  "relativeTime": {
+    "justNow": "just now",
+    "secondsAgo": "{count}s ago",
+    "minutesAgo": "{count}m ago",
+    "hoursAgo": "{count}h ago",
+    "daysAgo": "{count}d ago"
+  }
+}

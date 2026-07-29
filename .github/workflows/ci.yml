@@ -1,0 +1,161 @@
+name: CI
+
+# The gate is the repo's own `mise run verify` — lint, JVM tests, Go tests, web
+# unit tests, web build. CI runs that one command so it can never drift from
+# what a contributor runs locally. A second job enforces the one rule only CI
+# can see: what a pull request changes relative to its base.
+on:
+  # Only main on push: a pull request from a branch in this repo would otherwise
+  # be verified twice for the same commit.
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Flyway checksums each applied migration by whole file, so any byte changed in
+  # a shipped V*.sql — a comment included — fails validateOnMigrate and stops
+  # every existing install from booting. docs/migrations.md states the rule; this
+  # job enforces it, because a mechanical tree-wide edit has no concept of an
+  # immutable file class.
+  migrations:
+    name: migrations are append-only
+    # A base-ref diff only means something for a pull request; on push to main the
+    # commits are already merged and there is nothing to compare against.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # Full history: the guard diffs against the merge base with the PR's base
+      # branch, which a shallow clone does not contain.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Reject changes to existing migrations
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Explicit rather than inherited from the runner's default shell flags:
+          # an unreadable base or a failed diff has to stop the job, not produce
+          # empty output that reads like "nothing was touched".
+          set -euo pipefail
+          dir=control-plane/src/main/resources/db/migration
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo "::error::base commit $BASE_SHA is missing from this clone;" \
+              "the guard cannot diff against it." >&2
+            exit 1
+          fi
+          # --no-renames so a renamed migration surfaces as a delete plus an add:
+          # Flyway records the description too, so renaming a shipped file breaks
+          # validation exactly like editing it, and the delete is what trips here.
+          # Three dots: diff from the merge base, so migrations the base branch
+          # changed on its own are not attributed to this pull request.
+          touched=$(git diff --name-status --diff-filter=MD --no-renames \
+            "$BASE_SHA...HEAD" -- "$dir")
+          if [ -z "$touched" ]; then
+            echo "No existing migration was modified or deleted."
+            exit 0
+          fi
+          echo "$touched"
+          # The one sanctioned exception: before the first release there are no
+          # installs to break, so the history may be compacted once into
+          # final-state files. It is deliberately self-limiting — the presence of
+          # ANY release tag ends it, so the escape hatch closes at v0.1.0 and
+          # cannot be reused later by copying the marker.
+          if git log -1 --format=%B "$BASE_SHA...HEAD" 2>/dev/null \
+            | grep -qiF 'migration-reorg: sanctioned' \
+            || git log --format=%B "$BASE_SHA...HEAD" \
+            | grep -qiF 'migration-reorg: sanctioned'; then
+            if [ -n "$(git tag --list 'v*')" ]; then
+              echo "::error::a release tag exists, so the pre-release" \
+                "compaction exception no longer applies." >&2
+              exit 1
+            fi
+            echo "::warning::existing migrations were rewritten under the" \
+              "one-time pre-release compaction exception (no release tag yet)."
+            exit 0
+          fi
+          cat >&2 <<'MSG'
+
+          Migrations are append-only. The files above are modified (M) or deleted
+          (D), and at least one of them is already applied on existing installs.
+
+          Why this fails the build: Flyway checksums the whole file of every
+          applied migration and compares it on boot. Any byte that differs —
+          including a comment, whitespace, or a rename — makes validateOnMigrate
+          throw, control-plane startup aborts before it opens a port, and every
+          existing install stops booting until an operator repairs
+          flyway_schema_history by hand.
+
+          What to do instead: leave the shipped file byte-for-byte as it is and
+          add a new migration, V{n+1}__desc.sql, that makes the change forward.
+          Flyway Community has no down-migrations, so a revert is also a new
+          forward migration.
+
+          The rule and its rationale: docs/migrations.md
+          MSG
+          exit 1
+
+  verify:
+    name: verify
+    # ubuntu-latest ships a running Docker daemon (the DB-backed Testcontainers
+    # tests fail rather than skip without one) and gcc + libc headers (the
+    # analyzer's c-shared native lib is a cgo build).
+    runs-on: ubuntu-latest
+    # The gate pulls MySQL/PostgreSQL images, compiles Kotlin + Go, and builds
+    # Next.js; a cold cache is the slow case.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installs java, gradle, go, node, pnpm from mise.toml — the versions are
+      # never restated here — and exports JAVA_HOME/GOROOT/PATH to later steps.
+      # That PATH export is what puts `go` in front of the Gradle leg:
+      # :analyzer:jvm's processResources shells out to `go build
+      # -buildmode=c-shared`, so the JVM tests need Go, not just a JDK.
+      - uses: jdx/mise-action@v4
+
+      # Cache keys need the real cache locations, and Go's depend on how mise
+      # configured it — ask the tools instead of hardcoding paths.
+      - name: Resolve cache paths
+        id: paths
+        run: |
+          echo "go-mod=$(go env GOMODCACHE)" >>"$GITHUB_OUTPUT"
+          echo "go-build=$(go env GOCACHE)" >>"$GITHUB_OUTPUT"
+          echo "pnpm-store=$(pnpm store path --silent)" >>"$GITHUB_OUTPUT"
+
+      - name: Cache Go modules and build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ steps.paths.outputs.go-mod }}
+            ${{ steps.paths.outputs.go-build }}
+          key:
+            go-${{ runner.os }}-${{ hashFiles('go.work', '**/go.sum',
+            '**/go.mod') }}
+          restore-keys: go-${{ runner.os }}-
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.paths.outputs.pnpm-store }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+
+      # Caches the Gradle User Home (dependencies, wrapper distribution) and
+      # validates the checked-in wrapper jar's checksum. It only sets caching up
+      # — the build itself is invoked below by `mise run verify`, whose Gradle
+      # line already passes --no-daemon, so no shared daemon is left behind.
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Verify
+        run: mise run verify

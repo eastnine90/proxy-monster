@@ -1,0 +1,69 @@
+# Local dev infra for proxy-monster (DESIGN.md).
+#   pm-postgres     — the control-plane's own metadata store (catalog/policy/grants/audit).
+#   target-mysql    — the PRIMARY sample backend the proxy brokers to (MySQL is the main target).
+#   target-postgres — the add-on sample backend (Postgres is secondary).
+services:
+  pm-postgres:
+    image: postgres:17.6
+    environment:
+      POSTGRES_DB: proxymonster
+      POSTGRES_USER: proxymonster
+      POSTGRES_PASSWORD: proxymonster
+    ports:
+      # 5442 on the host to avoid clashing with a local Postgres on 5432.
+      - "5442:5432"
+    volumes:
+      - pm-postgres-data:/var/lib/postgresql/data
+    # `docker compose up -d --wait` (what `mise run dev` does) blocks until these report healthy.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proxymonster -d proxymonster"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  target-mysql:
+    image: mysql:8.4
+    # Enable mysql_native_password (disabled by default in 8.4) so the proxy's broker can do a
+    # simple native-password handshake to the backend. (caching_sha2 backend auth is a follow-up.)
+    command: ["--mysql-native-password=ON"]
+    environment:
+      MYSQL_DATABASE: acme
+      MYSQL_USER: acme
+      MYSQL_PASSWORD: acme
+      MYSQL_ROOT_PASSWORD: root
+    # 31307 on the host — a high, uncontended port (3306/3307 clash with local MySQLs, and a
+    # leaked Docker Desktop reservation on 3307 can wedge recreates).
+    ports:
+      - "31307:3306"
+    volumes:
+      - ./deploy/seed/target-seed-mysql.sql:/docker-entrypoint-initdb.d/target-seed-mysql.sql
+      - target-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uacme", "-pacme"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  target-postgres:
+    image: postgres:17.6
+    environment:
+      POSTGRES_DB: acme
+      POSTGRES_USER: acme
+      POSTGRES_PASSWORD: acme
+      # Dev only: trust auth so the proxy's broker handshake needs no password.
+      # Real service-account auth (md5/scram) is a production concern.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    # 5433 on the host to avoid clashing with pm-postgres on 5432.
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./deploy/seed/target-seed.sql:/docker-entrypoint-initdb.d/target-seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acme -d acme"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pm-postgres-data:
+  target-mysql-data:

@@ -1,0 +1,20 @@
+[
+  { "uid": { "type": "Role", "id": "auditor" }, "attrs": {}, "parents": [] },
+  { "uid": { "type": "User", "id": "alice" }, "attrs": {}, "parents": [] },
+  {
+    "uid": { "type": "User", "id": "bob" },
+    "attrs": {},
+    "parents": [{ "type": "Role", "id": "auditor" }]
+  },
+  {
+    "uid": { "type": "AuditRecord", "id": "rec-alice" },
+    "attrs": { "principal": { "__entity": { "type": "User", "id": "alice" } } },
+    "parents": []
+  },
+  {
+    "uid": { "type": "AuditRecord", "id": "rec-bob" },
+    "attrs": { "principal": { "__entity": { "type": "User", "id": "bob" } } },
+    "parents": []
+  },
+  { "uid": { "type": "AuditLog", "id": "all" }, "attrs": {}, "parents": [] }
+]

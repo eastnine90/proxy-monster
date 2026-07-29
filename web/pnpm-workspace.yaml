@@ -1,0 +1,17 @@
+# unrs-resolver ships a native binding the eslint resolver needs at runtime, so
+# allow its build. @parcel/watcher and @swc/core come from next-intl's own
+# dependency tree (message-file watching + build tooling) — standard, reputable
+# native bindings, allowed for the same reason. sharp (Next's optional image
+# optimizer) is explicitly ignored — we don't do heavy image optimization, and
+# building it can trip on libvips locally. Listing all of them leaves no
+# "undecided" build script, so pnpm exits 0 (otherwise it returns non-zero and
+# breaks `shadcn add`'s internal pnpm add).
+onlyBuiltDependencies:
+  - unrs-resolver
+ignoredBuiltDependencies:
+  - sharp
+allowBuilds:
+  "@parcel/watcher": true
+  "@swc/core": true
+  sharp: true
+  unrs-resolver: true

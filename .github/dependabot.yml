@@ -1,0 +1,50 @@
+# Dependency updates for every ecosystem in the repo. The gate a bump has to pass
+# is the same one a contributor runs: `mise run verify` through .github/workflows/ci.yml.
+#
+# Grouped per ecosystem rather than one PR per dependency: the JVM and Go trees each
+# pin transitively-coupled sets (grpc-java + protobuf, the AWS SDK modules), and
+# splitting those lands a PR that cannot build on its own.
+version: 2
+updates:
+  - package-ecosystem: gradle
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      jvm:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # One entry per Go module: the root go.work is a workspace, not a module, so
+  # Dependabot resolves each module's own go.mod.
+  - package-ecosystem: gomod
+    directories:
+      - /analyzer
+      - /auditmon
+      - /goproxy
+      - /mysqlwire
+      - /pmon
+      - /pmontray
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      web:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

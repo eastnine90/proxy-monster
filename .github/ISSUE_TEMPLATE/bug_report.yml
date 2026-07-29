@@ -1,0 +1,173 @@
+name: Bug report
+description:
+  Something behaves incorrectly — a wrong decision, a crash, a broken screen
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Not for security vulnerabilities. A leak — an unmasked value that should
+        have been masked, or a statement that ran where it should have been
+        denied — goes privately to the maintainers instead, per
+        [SECURITY.md](https://github.com/ridi-oss/proxy-monster/blob/main/SECURITY.md).
+
+        Accepted caveats and deliberate over-denies are listed in
+        [KNOWN_LIMITATIONS.md](https://github.com/ridi-oss/proxy-monster/blob/main/KNOWN_LIMITATIONS.md);
+        check there first, since fail-closed denies are often by design.
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      description: >-
+        MySQL is the primary, fully-enforced target and the correctness bar.
+        PostgreSQL support is experimental, so a PostgreSQL-only edge case may
+        be recorded as a known limitation rather than fixed right away.
+      options:
+        - MySQL
+        - PostgreSQL
+        - Both
+        - Not engine-specific
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Where the wrong behavior surfaces. Pick the closest one.
+      options:
+        - "goproxy — the wire proxy (data plane)"
+        - "control-plane — decisions, policy, catalog, admin API"
+        - "analyzer — SQL lineage and required grants"
+        - "web — the console"
+        - "pmon — the client broker daemon"
+        - "auditmon — the audit-trail monitor"
+        - "Build, tests, or docs"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind of bug
+      description: >-
+        An enforcement bug is a wrong decision for a statement — the
+        characteristic bug in an access-control proxy. Fill in the decision
+        fields below when you pick it.
+      options:
+        - "Enforcement — wrong decision for a statement"
+        - "Wrong result data — right decision, wrong rows or wrong masked value"
+        - "Connection or protocol failure"
+        - "Crash, hang, or error"
+        - "Console or API misbehavior"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: statement
+    attributes:
+      label: Statement or repro
+      description: >-
+        For an enforcement bug, the smallest statement that shows it, plus the
+        table and column definitions it touches, the column tags in play, and
+        the roles the principal holds. Otherwise the steps to reproduce. Redact
+        real data — synthetic values only.
+      render: sql
+      placeholder: |
+        CREATE TABLE users (id BIGINT PRIMARY KEY, email VARCHAR(255), created_at DATETIME);
+        -- email tagged pii; principal holds role `analyst`
+        SELECT UPPER(email) FROM users WHERE id = 1;
+    validations:
+      required: true
+
+  - type: dropdown
+    id: expected
+    attributes:
+      label: Expected decision
+      options:
+        - ALLOW
+        - MASK
+        - DENY
+        - Not an enforcement bug
+    validations:
+      required: true
+
+  - type: dropdown
+    id: observed
+    attributes:
+      label: Observed decision
+      options:
+        - ALLOW
+        - MASK
+        - DENY
+        - Error, not a decision
+        - Not an enforcement bug
+    validations:
+      required: true
+
+  - type: textarea
+    id: detail
+    attributes:
+      label: What happened
+      description: >-
+        The full picture — what you expected, what you got, and why you believe
+        the decision is wrong. Include the deny reason the client received, the
+        columns you expected masked versus the ones that were, and the decision
+        id from the audit trail if you have it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        Relevant control-plane and proxy output. Scrub credentials, tokens, and
+        real data.
+      render: shell
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: >-
+        proxy-monster is pre-1.0 with no tagged releases — `main` is the only
+        supported line. Paste the commit you are running, from `git rev-parse
+        --short HEAD`.
+      placeholder: 1a2b3c4
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >-
+        How you are running it — the local `mise run dev` stack or your own
+        deployment — plus the OS, the backend database version, and the client
+        you connected with (`mysql`, `psql`, JDBC, the console editor).
+      placeholder: |
+        Local `mise run dev` stack on macOS 15 (Apple Silicon)
+        Backend: MySQL 8.4 (sample compose backend)
+        Client: mysql 8.4 CLI through pmon
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before filing
+      options:
+        - label: >-
+            This is not a security vulnerability. If it is a leak or a bypass, I
+            will report it privately instead.
+          required: true
+        - label: >-
+            I checked
+            [KNOWN_LIMITATIONS.md](https://github.com/ridi-oss/proxy-monster/blob/main/KNOWN_LIMITATIONS.md)
+            and this is not an accepted caveat.
+          required: true

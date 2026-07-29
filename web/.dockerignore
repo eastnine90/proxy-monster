@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+.vercel
+public/cedar
+*.tsbuildinfo
+npm-debug.log*
+.pnpm-debug.log*
+.env*
+coverage
+playwright-report
+test-results

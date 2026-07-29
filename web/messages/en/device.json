@@ -1,0 +1,14 @@
+{
+  "tagline": "DB access-control proxy",
+  "title": "Device login",
+  "instruction": "Enter the code shown in your terminal.",
+  "confirm": "Confirm this is the code shown in your terminal.",
+  "codeLabel": "Verification code",
+  "continue": "Continue",
+  "continuing": "Continuing…",
+  "error": "This code is unknown, already used, or expired — run `pmon login` again.",
+  "success": {
+    "title": "Login successful",
+    "body": "You're logged in — return to your terminal. pmon will finish automatically. You can close this tab."
+  }
+}

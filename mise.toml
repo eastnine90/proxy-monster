@@ -1,0 +1,373 @@
+[settings]
+# Put this repo's pinned tools AHEAD of anything already on PATH. Without it a Homebrew `node`/`pnpm`
+# earlier in PATH shadows the pins below, and `pnpm install` then runs under the wrong pnpm major.
+activate_aggressive = true
+
+[tools]
+gradle = "8.14.5"
+# Stock JDK 24 — the floor for this build. Bytecode targets 24 (--release 24), so an older JDK fails
+# to compile; the analyzer also calls sqlglot-go's probe via the Foreign Function & Memory API
+# (java.lang.foreign), which JDK 24 provides.
+java = "temurin-24.0.2"
+# Go builds the analyzer's c-shared native lib (analyzer/cmd/libsqlglot, via cgo) as part of the
+# Gradle build; matches analyzer/go.mod. (Zig — the Linux cross C compiler for the all-targets fat-jar
+# build, -Psqlglot.native.all=true — is only needed for that; add it when CI is wired.)
+go = "1.23"
+# web/ (Next.js). Pinned rather than "whatever's on PATH" so `pnpm install`'s lockfile resolution
+# and `next build` behavior stay reproducible across machines. Match web/Dockerfile's base image +
+# corepack pin when bumping either.
+node = "24.18.0"
+pnpm = "10.22.0"
+
+# Tasks. `mise run dev` is the whole local stack; `mise run verify` is the whole verification gate.
+# Each component also has its own task, so you can run one against a stack you started by hand.
+#
+# Every task runs from the repo root with the pinned toolchain on PATH, so `mise run <task>` works
+# from any subdirectory and no task needs to cd into a module. Every tunable reads through
+# `${VAR:-default}`, so an exported env var beats the default here — e.g.
+# `PM_HTTP_PORT=41390 mise run control-plane`. `mise tasks ls` lists them.
+
+[tasks.up]
+description = "Start the local datastores (control-plane store + sample MySQL/PG backends); waits until healthy"
+shell = "bash -c"
+# Idempotent, and safe when two callers overlap: on an already-healthy stack this only reads state. Two
+# concurrent `docker compose up` runs on one project fight over the same containers, and the loser tears
+# down what the winner just started.
+# mise renders every task script through a template engine first, so this script stays free of the
+# brace syntax that engine claims -- hence counting healthy services out of `ps --format json` rather
+# than formatting them with a Go template.
+run = '''
+set -euo pipefail
+want=$(docker compose config --services | grep -c .)
+healthy=$(docker compose ps --format json | tr ',' '\n' | grep -c '"Health":"healthy"' || true)
+if [ "$want" -gt 0 ] && [ "$want" -eq "$healthy" ]; then
+  echo "up: datastores already healthy"
+  exit 0
+fi
+docker compose up -d --wait
+'''
+
+[tasks.down]
+description = "Stop the local datastores (their volumes survive)"
+run = "docker compose down"
+
+[tasks.control-plane]
+description = "Run the control plane against the local store — HTTP :8080, gRPC :9090"
+depends = ["up"]
+shell = "bash -c"
+run = 'PM_DB_URL="${PM_DB_URL:-jdbc:postgresql://localhost:5442/proxymonster}" ./gradlew --no-daemon :control-plane:run'
+
+[tasks.proxy-mysql]
+description = "Run a wire proxy on :6033 fronting the sample MySQL backend (datasource acme-mysql)"
+depends = ["up"]
+shell = "bash -c"
+run = '''
+PM_ENGINE=mysql \
+PM_DATASOURCE_NAME="${PM_DATASOURCE_NAME:-acme-mysql}" \
+PM_PROXY_PORT="${PM_PROXY_PORT:-6033}" \
+PM_TARGET_HOST="${PM_TARGET_HOST:-127.0.0.1}" \
+PM_TARGET_PORT="${PM_TARGET_PORT:-31307}" \
+PM_TARGET_DB="${PM_TARGET_DB:-acme}" \
+PM_TARGET_USER="${PM_TARGET_USER:-acme}" \
+PM_TARGET_PASSWORD="${PM_TARGET_PASSWORD:-acme}" \
+PM_CONTROL_PLANE_GRPC="${PM_CONTROL_PLANE_GRPC:-127.0.0.1:9090}" \
+  go run ./goproxy/cmd/goproxy
+'''
+
+[tasks.proxy-postgres]
+description = "Run a wire proxy on :6432 fronting the sample PostgreSQL backend (datasource acme-target)"
+depends = ["up"]
+shell = "bash -c"
+run = '''
+PM_ENGINE=postgres \
+PM_DATASOURCE_NAME="${PM_DATASOURCE_NAME:-acme-target}" \
+PM_PROXY_PORT="${PM_PROXY_PORT:-6432}" \
+PM_TARGET_HOST="${PM_TARGET_HOST:-127.0.0.1}" \
+PM_TARGET_PORT="${PM_TARGET_PORT:-5433}" \
+PM_TARGET_DB="${PM_TARGET_DB:-acme}" \
+PM_TARGET_USER="${PM_TARGET_USER:-acme}" \
+PM_TARGET_PASSWORD="${PM_TARGET_PASSWORD:-acme}" \
+PM_CONTROL_PLANE_GRPC="${PM_CONTROL_PLANE_GRPC:-127.0.0.1:9090}" \
+  go run ./goproxy/cmd/goproxy
+'''
+
+[tasks.web]
+description = "Run the web console on :41300 against the local control plane"
+shell = "bash -c"
+# web/next.config.ts defaults PM_PROXY_TARGET to :41390; the control-plane task serves :8080, so point
+# the console there.
+run = '''
+set -euo pipefail
+pnpm -C web install
+PM_PROXY_TARGET="${PM_PROXY_TARGET:-http://127.0.0.1:8080}" pnpm -C web dev
+'''
+
+[tasks.dev]
+description = "The whole local stack: datastores, control plane, both wire proxies, web console"
+shell = "bash -c"
+run = '''
+set -euo pipefail
+
+cp_url="${PM_CONTROL_PLANE_HTTP:-http://127.0.0.1:8080}"
+
+# Datastores first: the control plane needs its store, and each proxy introspects its target on boot.
+mise run up
+
+pids=()
+cleanup() {
+  trap - EXIT INT TERM
+  for pid in "${pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done
+  wait 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+start() { # start <task> [VAR=VAL …]
+  local task="$1"
+  shift
+  env "$@" mise run "$task" &
+  pids+=("$!")
+}
+
+# Each proxy registers with the control plane on boot and gives up after three tries, so wait for it.
+start control-plane
+echo "dev: waiting for the control plane at ${cp_url}/health …"
+for _ in $(seq 1 150); do
+  curl -fsS "${cp_url}/health" >/dev/null 2>&1 && break
+  sleep 2
+done
+curl -fsS "${cp_url}/health" >/dev/null
+
+# Give each proxy its own port and target explicitly. Both read the same PM_PROXY_PORT/PM_TARGET_PORT
+# names, so one inherited value would otherwise land both on one port -- which is also why the
+# per-proxy override knobs below are separate names. MySQL is the primary target, so it leads.
+start proxy-mysql \
+  PM_PROXY_PORT="${PM_MYSQL_PROXY_PORT:-6033}" \
+  PM_TARGET_PORT="${PM_MYSQL_TARGET_PORT:-31307}"
+start proxy-postgres \
+  PM_PROXY_PORT="${PM_PG_PROXY_PORT:-6432}" \
+  PM_TARGET_PORT="${PM_PG_TARGET_PORT:-5433}"
+# Hand web the same control-plane URL this task just waited on, so the console's /api and /auth rewrite
+# can never point somewhere else.
+start web PM_PROXY_TARGET="${PM_PROXY_TARGET:-$cp_url}"
+
+cat <<BANNER
+
+dev: stack up.
+  web console       http://localhost:41300
+  control plane     ${cp_url}
+  MySQL proxy       127.0.0.1:${PM_MYSQL_PROXY_PORT:-6033}   → sample backend, datasource acme-mysql
+  PostgreSQL proxy  127.0.0.1:${PM_PG_PROXY_PORT:-6432}   → sample backend, datasource acme-target
+
+Ctrl-C stops what this task started; the datastores keep running -- stop them with: mise run down
+
+BANNER
+
+wait
+'''
+
+[tasks.lint]
+description = "Lint: prettier over docs/config (md, json, yaml, css) + eslint over the web sources"
+shell = "bash -c"
+# Prettier owns the prose-and-config formats; TypeScript stays with eslint, which already has the
+# Next.js rule set. It is invoked by path from the repo root rather than through `pnpm -C web exec`,
+# because its scope is the whole tree and both `.prettierrc.json` and `.prettierignore` are resolved
+# relative to the working directory. `--write` instead of `--check` reformats in place.
+run = '''
+set -euo pipefail
+pnpm -C web install
+./web/node_modules/.bin/prettier --check '**/*.{md,json,yml,yaml,css}'
+pnpm -C web lint
+'''
+
+[tasks.format]
+description = "Reformat the prose-and-config files prettier owns (md, json, yaml, css) in place"
+shell = "bash -c"
+run = '''
+set -euo pipefail
+pnpm -C web install
+./web/node_modules/.bin/prettier --write '**/*.{md,json,yml,yaml,css}'
+'''
+
+[tasks.verify]
+description = "The full verification gate: lint, JVM tests, Go tests, web unit tests + build"
+shell = "bash -c"
+run = '''
+set -euo pipefail
+mise run lint
+# The JVM tests are DB-backed (Testcontainers) and fail rather than skip, so Docker must be running.
+# --no-daemon: a shared Gradle daemon is machine-wide state, so a build here can recycle a JVM another
+# process depends on. Without it, this gate is not self-contained.
+./gradlew --no-daemon :analyzer:jvm:test :engine:test :control-plane:test
+# Explicit module patterns: the repo root is a Go workspace, not a module, so `./...` does not resolve
+# there. go.work is what makes these root-relative paths work with no cd.
+go test ./analyzer/... ./auditmon/... ./goproxy/... ./mysqlwire/... ./pmon/...
+pnpm -C web test:unit
+pnpm -C web build
+'''
+
+[tasks.test-jvm]
+description = "JVM tests against one database version (defaults to the newest supported)"
+run = "./gradlew --no-daemon test"
+
+[tasks.test-go]
+description = "Go tests against one database version (defaults to the newest supported)"
+shell = "bash -c"
+# Each Go module is entered explicitly rather than using a root `./...`: the repo root is not a Go
+# module, so a root-relative pattern only resolves once a go.work exists.
+run = '''
+set -euo pipefail
+for m in analyzer auditmon goproxy mysqlwire pmon; do
+  echo "=== $m ==="
+  (cd "$m" && go test ./...)
+done
+'''
+
+[tasks.test]
+description = "All tests against the newest supported database version — the local default"
+depends = ["test-jvm", "test-go"]
+
+[tasks.test-db-matrix]
+description = "Sweep the DB-backed tests over EVERY supported database version (db-support.json)"
+shell = "bash -c"
+# Sequential by default — one database container at a time, and the ordinary `build/` tree, so the run
+# is easy to follow and leaves the incremental build cache warm. `PM_MATRIX_PARALLEL=1` (or
+# `mise run test-db-matrix-parallel`) runs every leg at once instead; see that task for what isolation
+# it needs. Legs are not aborted on the first failure — which versions fail is the useful output — but
+# any failure fails the task.
+run = '''
+set -uo pipefail
+if [ "${PM_MATRIX_PARALLEL:-0}" != "0" ]; then
+  exec mise run test-db-matrix-parallel
+fi
+pgs=$(jq -r '[.storage[] | select(.engine == "postgres") | .image] | join(" ")' db-support.json)
+mysqls=$(jq -r '[.target[] | select(.engine == "mysql") | .image] | join(" ")' db-support.json)
+if [ -z "$pgs" ] || [ -z "$mysqls" ]; then
+  echo "db-support.json yielded no versions to test" >&2
+  exit 1
+fi
+failed=""
+for pg in $pgs; do
+  for my in $mysqls; do
+    echo "=== $pg + $my ==="
+    if ! PM_TEST_POSTGRES_IMAGE="$pg" PM_TEST_MYSQL_IMAGE="$my" PM_REQUIRE_DB_TESTS=true \
+        ./gradlew --no-daemon :control-plane:test; then
+      failed="$failed jvm($pg,$my)"
+    fi
+    if ! (cd goproxy && PM_TEST_POSTGRES_IMAGE="$pg" PM_TEST_MYSQL_IMAGE="$my" go test ./...); then
+      failed="$failed goproxy($pg,$my)"
+    fi
+  done
+  if ! (cd auditmon && PM_TEST_POSTGRES_IMAGE="$pg" go test ./...); then
+    failed="$failed auditmon($pg)"
+  fi
+done
+if [ -n "$failed" ]; then
+  echo "FAILED legs:$failed" >&2
+  exit 1
+fi
+echo "all supported database versions passed"
+'''
+
+[tasks.test-db-matrix-parallel]
+description = "Same sweep, version legs run concurrently (PM_MATRIX_JOBS caps how many at once)"
+shell = "bash -c"
+# Concurrent legs. Three things make that work, and all are required:
+#
+#   -Ppm.buildDir  — two Gradle invocations in one project directory fight over `build/`: the second
+#                    deletes the classes the first is compiling ("Unable to delete directory
+#                    .../classes/kotlin/test"). Each leg gets its own build tree.
+#   --project-cache-dir — likewise per-leg, so the legs do not block on one lock.
+#   PM_MATRIX_JOBS — a concurrency CAP, because the binding constraint is the DOCKER VM, not the host.
+#                    Host RAM is irrelevant here: Docker Desktop's VM gets a fixed slice of it (often
+#                    ~8 GB on a machine with 64 — check `docker info`), and every JVM leg starts its own
+#                    PostgreSQL AND MySQL server inside that slice. N legs means 2N database servers.
+#                    Past the VM's budget they do not fail cleanly: connections are refused mid-suite
+#                    and it surfaces as "Communications link failure" / ConnectException, which reads
+#                    like a product bug rather than exhaustion.
+#
+# Default cap is 2 legs (4 database servers), which fits an ~8 GB VM. Raising it needs VM memory, not
+# host memory — measured on a 7.75 GiB VM, 4 legs (8 servers) fails. To go wider, raise Docker
+# Desktop's memory limit first, then: PM_MATRIX_JOBS=4 mise run test-db-matrix-parallel
+# PM_MATRIX_HEAP tunes each leg's Gradle heap (default 3g) if the Kotlin compile is what runs short.
+#
+# Output goes to per-leg log files; interleaved stdout from several suites at once is unreadable. A
+# leg's log is printed only if it fails.
+run = '''
+set -uo pipefail
+jobs_cap="${PM_MATRIX_JOBS:-2}"
+case "$jobs_cap" in ''|*[!0-9]*|0) echo "PM_MATRIX_JOBS must be a positive integer" >&2; exit 1;; esac
+legs=$(jq -r '
+  [ .storage[] | select(.engine == "postgres") | .image ] as $pg
+  | [ .target[] | select(.engine == "mysql")   | .image ] as $my
+  | [ $pg[] as $p | $my[] as $m | "\($p) \($m)" ] | .[]
+' db-support.json)
+pgs=$(jq -r '[.storage[] | select(.engine == "postgres") | .image] | join(" ")' db-support.json)
+if [ -z "$legs" ] || [ -z "$pgs" ]; then
+  echo "db-support.json yielded no versions to test" >&2
+  exit 1
+fi
+logs=$(mktemp -d)
+echo "logs: $logs"
+# mise renders this script through a template engine first, so no Go-template braces here — the
+# VM's memory is read out of `docker info`'s plain output instead of formatted.
+echo "docker vm memory: $(docker info 2>/dev/null | sed -n 's/^ *Total Memory: *//p')"
+
+# Wait until fewer than $jobs_cap background jobs remain. `wait -n` returns on the first one to
+# finish, so this throttles without polling. A leg records its own failure to $logs/failed, so a
+# non-zero exit here is not the signal and must not abort the sweep.
+throttle() {
+  while [ "$(jobs -pr | wc -l)" -ge "$jobs_cap" ]; do wait -n || true; done
+}
+
+n=0
+while read -r pg my; do
+  [ -n "$pg" ] || continue
+  n=$((n + 1))
+  tag="${pg//[:\/]/-}__${my//[:\/]/-}"
+  throttle
+  echo "--> leg $n: $pg + $my"
+  (
+    # Each leg's build tree is cold, so every leg compiles Kotlin from scratch. Concurrent --no-daemon
+    # builds get the JVM's default heap, which is not enough for two Kotlin backends at once: the
+    # compiler dies with "OutOfMemoryError: GC overhead limit exceeded" mid-codegen, which reads like a
+    # source error rather than a resource one. Give each leg an explicit heap.
+    PM_TEST_POSTGRES_IMAGE="$pg" PM_TEST_MYSQL_IMAGE="$my" PM_REQUIRE_DB_TESTS=true \
+      GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx${PM_MATRIX_HEAP:-3g}" \
+      ./gradlew --no-daemon --no-build-cache -Ppm.buildDir=".gradle-matrix/$tag" \
+      --project-cache-dir "$logs/gradle-$tag" :control-plane:test \
+      > "$logs/jvm-$tag.log" 2>&1 || echo "jvm($pg,$my)" >> "$logs/failed"
+    (cd goproxy && PM_TEST_POSTGRES_IMAGE="$pg" PM_TEST_MYSQL_IMAGE="$my" \
+      PM_TEST_CONTAINER_SUFFIX="$tag" go test ./...) \
+      > "$logs/goproxy-$tag.log" 2>&1 || echo "goproxy($pg,$my)" >> "$logs/failed"
+  ) &
+done <<< "$legs"
+# auditmon is PostgreSQL-only, so it is one leg per PostgreSQL version rather than per pair.
+for pg in $pgs; do
+  throttle
+  echo "--> auditmon leg: $pg"
+  (
+    (cd auditmon && PM_TEST_POSTGRES_IMAGE="$pg" PM_TEST_CONTAINER_SUFFIX="am-${pg//[:\/]/-}" go test ./...) \
+      > "$logs/auditmon-${pg//[:\/]/-}.log" 2>&1 || echo "auditmon($pg)" >> "$logs/failed"
+  ) &
+done
+wait
+if [ -f "$logs/failed" ]; then
+  echo "FAILED legs:" >&2
+  sort -u "$logs/failed" >&2
+  # Print the failing legs' output; a bare list of names is not actionable. Match compile/infra failures
+  # too, not just test failures — a leg that never got as far as running a test is the most confusing
+  # kind to debug from names alone.
+  for f in "$logs"/*.log; do
+    grep -qE "^FAIL|^--- FAIL|BUILD FAILED|^e: |OutOfMemoryError" "$f" && {
+      echo "--- $f ---" >&2
+      grep -E "^FAIL|^--- FAIL|BUILD FAILED|^e: |OutOfMemoryError|^\s+[A-Za-z].*: " "$f" | head -25 >&2
+    }
+  done
+  echo >&2
+  echo "If failures look like refused/dropped connections rather than assertion failures, the Docker" >&2
+  echo "VM is likely out of memory for $jobs_cap concurrent legs ($((jobs_cap * 2)) database servers)." >&2
+  echo "Lower PM_MATRIX_JOBS or raise Docker Desktop's memory limit." >&2
+  exit 1
+fi
+echo "all supported database versions passed ($n pairs, up to $jobs_cap legs at a time)"
+'''

@@ -1,0 +1,199 @@
+{
+  "actions": {
+    "cancel": "Cancel",
+    "submitRequest": "Submit request",
+    "submitting": "Submitting…",
+    "approve": "Approve",
+    "approving": "Approving…",
+    "reject": "Reject",
+    "rejecting": "Rejecting…",
+    "revoke": "Revoke",
+    "revoking": "Revoking…",
+    "runQuery": "Run query",
+    "running": "Running…",
+    "cancelExecution": "Cancel execution",
+    "cancelingExecution": "Canceling…",
+    "generate": "Generate",
+    "done": "Done",
+    "copy": "Copy",
+    "copied": "Copied",
+    "copyCommand": "Copy command"
+  },
+  "fields": {
+    "requester": "Requester",
+    "role": "Role",
+    "datasource": "Datasource",
+    "datasourceOptional": "Datasource (optional)",
+    "timestamp": "Timestamp",
+    "denyReason": "Deny reason",
+    "sql": "SQL",
+    "requestedDuration": "Requested duration",
+    "created": "Created",
+    "decided": "Decided",
+    "decidedBy": "Decided by",
+    "reason": "Reason",
+    "reasonRequired": "Reason (required)",
+    "rejectionReason": "Rejection reason",
+    "sourceDecision": "Source decision",
+    "requesterReason": "Requester reason",
+    "grantDuration": "Grant duration"
+  },
+  "durations": {
+    "asRequested": "As requested",
+    "m30": "30 minutes",
+    "h1": "1 hour",
+    "h2": "2 hours",
+    "h4": "4 hours",
+    "h8": "8 hours",
+    "h12": "12 hours"
+  },
+  "ttls": {
+    "m15": "15 minutes",
+    "h1": "1 hour",
+    "h6": "6 hours",
+    "h12": "12 hours",
+    "h24Max": "24 hours (max)"
+  },
+  "relativeTime": {
+    "justNow": "just now",
+    "minutesAgo": "{count}m ago",
+    "hoursAgo": "{count}h ago",
+    "daysAgo": "{count}d ago"
+  },
+  "durationFormat": {
+    "hoursMinutes": "{hours}h {minutes}m",
+    "hours": "{hours}h",
+    "minutes": "{minutes}m"
+  },
+  "values": {
+    "anyDatasource": "Any datasource",
+    "anyDatasourceLower": "any datasource",
+    "unknownRole": "unknown role",
+    "noSqlAttached": "No SQL attached.",
+    "proactive": "proactive",
+    "datasourceNumbered": "datasource #{id}"
+  },
+  "masterDetail": {
+    "pageTitle": "Workflows",
+    "pageSubtitle": "Review incoming requests and track role access or query approvals you requested.",
+    "activeGrants": "Active grants",
+    "newRequest": "New request",
+    "roleAccessRequest": "Role access request",
+    "queryApprovalRequest": "Query approval request",
+    "loadingRequests": "Loading workflow requests…",
+    "lookingUpType": "Looking up request type…",
+    "invalidRequestId": "Request id must be a positive number.",
+    "selectRequestTitle": "Select a request",
+    "selectRequestHint": "Choose a workflow from the list, or compose a new request.",
+    "tabs": {
+      "all": "All",
+      "incoming": "Incoming",
+      "outgoing": "Outgoing"
+    },
+    "empty": {
+      "incomingTitle": "Inbox zero.",
+      "incomingHint": "No requests are waiting for your review.",
+      "outgoingTitle": "No outgoing requests.",
+      "outgoingHint": "Create a role access or query approval request.",
+      "allTitle": "No workflow requests yet.",
+      "allHint": "Incoming and outgoing requests will appear here."
+    }
+  },
+  "newPage": {
+    "unknownKind": "Unknown request kind: {kind}.",
+    "sourceDecisionPositive": "Source decision id must be a positive number.",
+    "sourceDecisionQueryOnly": "A source decision can only be used for a query approval request."
+  },
+  "requestList": {
+    "roleAccessTitle": "Role access: {role}",
+    "queryApprovalTitle": "Query approval #{id}",
+    "incoming": "Incoming",
+    "outgoing": "Outgoing"
+  },
+  "queryComposer": {
+    "wouldAllowToast": "This query is currently allowed — it does not need approval, but the request was filed for review.",
+    "loadingDenied": "Loading denied decision…",
+    "onlyDeniedApproval": "Only denied queries can be requested for approval.",
+    "deniedDecisionTitle": "Denied decision #{id}",
+    "queryToReview": "Query to review",
+    "titleOptional": "Title (optional)",
+    "titleRequired": "Title (required)",
+    "titlePlaceholder": "Incident triage / support investigation / monthly report",
+    "reasonPlaceholder": "Why do you need this query reviewed?",
+    "discoverRoles": "Check available roles",
+    "discovering": "Checking…",
+    "discoverFailed": "Couldn't check roles — you can still submit without one.",
+    "selectRole": "Select an elevation role",
+    "noRolesFound": "No role would change the outcome for this query.",
+    "alreadyAllowed": "This query is already allowed without an elevated role.",
+    "unmasksHint": "Unmasks: {columns}"
+  },
+  "roleComposer": {
+    "submittedToast": "Access request submitted — awaiting approver review",
+    "submitFailed": "failed to submit request",
+    "title": "Request role access",
+    "description": "Request a time-boxed role grant. Approvers see the role, datasource, and your reason.",
+    "selectRole": "Select a role",
+    "reasonPlaceholder": "Investigating refund dispute #44219 — need orders ⋈ customers."
+  },
+  "roleDetail": {
+    "title": "Role access request #{id}",
+    "notRoleError": "Role request detail cannot render a non-ROLE request.",
+    "approvedToast": "Approved — {principal} granted \"{role}\"",
+    "approveFailed": "approve failed",
+    "rejectedToast": "Rejected — request from {principal}"
+  },
+  "activeGrants": {
+    "revokedToast": "Revoked \"{role}\" grant",
+    "revokeFailed": "revoke failed",
+    "heading": "Active grants",
+    "loading": "Loading grants…",
+    "emptyTitle": "No active elevation.",
+    "emptyHint": "Approved JIT grants appear here while live.",
+    "grantedBy": "granted by <code>{grantedBy}</code>{time}"
+  },
+  "approvalDetail": {
+    "loading": "Loading approval request…",
+    "noRows": "No rows.",
+    "approverExecution": "Approver execution",
+    "queryApprovalFallbackTitle": "Query approval #{id}",
+    "submittedToast": "Execution submitted.",
+    "runFailed": "run failed",
+    "canceledToast": "Execution canceled.",
+    "cancelFailed": "cancel failed",
+    "rejectedToast": "Query approval rejected",
+    "rejectFailed": "reject failed",
+    "approvedExecuteUnderR": "Approved — an approver may submit it under the requested role.",
+    "runUnderRole": "Run the approved query under the requested role. Progress and results update automatically.",
+    "runStatus": "{status} · {rows, plural, one {# row} other {# rows}} · expires {expires}",
+    "failedCode": "Execution failed: {code}",
+    "awaitingApprover": "Awaiting an approver to run this query.",
+    "rejectTitle": "Reject query approval",
+    "rejectDescription": "Reject this query approval request from {principal}.",
+    "rejectPlaceholder": "Explain why this query should not be approved."
+  },
+  "approveDialog": {
+    "approveFailed": "approve failed",
+    "approvedToast": "Approved query request from {principal}",
+    "title": "Approve query request",
+    "descriptionWithPrincipal": "Approve {principal}'s query request.",
+    "descriptionFallback": "Approve this query request.",
+    "executeUnderRNote": "Once approved, an approver runs the query under the requested role and releases the result — the requester never sees more than that role would."
+  },
+  "tokenDialog": {
+    "generateFailed": "Generate failed",
+    "generateTitle": "Generate connection token",
+    "generateDescription": "A time-limited password for connecting through the proxy with your roles. It expires automatically — there are no permanent tokens.",
+    "nameOptional": "Name (optional)",
+    "namePlaceholder": "e.g. DataGrip on laptop",
+    "expiresIn": "Expires in",
+    "connectionStringFor": "Connection-string for",
+    "datasourcePlaceholder": "datasource",
+    "generatedTitle": "Token generated",
+    "generatedDescription": "Copy it now — it's shown only once. Expires {date}.",
+    "warning": "This is a connection password. Anyone with it can connect as you (with your roles) until it expires. It is never shown again.",
+    "token": "Token",
+    "connectionString": "Connection string",
+    "connectionStringWithName": "Connection string · {name}"
+  }
+}

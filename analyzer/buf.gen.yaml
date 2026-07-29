@@ -1,0 +1,16 @@
+version: v2
+# Generates Go bindings for analyzer.proto plus the shared engine.proto it imports
+# (docs/statement-facts-contract.md) — the analyzer<->JVM FFM boundary. proto/src/main/proto/
+# also holds controlplane.proto (the separate proxy<->control-plane gRPC contract, owned by
+# goproxy/buf.gen.yaml); regenerate with explicit --path flags so this module's codegen never picks
+# that file up:
+#   cd analyzer && buf generate ../proto/src/main/proto --path ../proto/src/main/proto/analyzer.proto --path ../proto/src/main/proto/engine.proto
+managed:
+  enabled: true
+  override:
+    - file_option: go_package
+      value: github.com/ridi-oss/proxy-monster/analyzer/probe/pb
+plugins:
+  - local: protoc-gen-go
+    out: probe/pb
+    opt: paths=source_relative

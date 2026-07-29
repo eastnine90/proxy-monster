@@ -1,0 +1,88 @@
+{
+  "common": {
+    "bad_id": "Invalid ID.",
+    "not_found": "No such {resource}.",
+    "field_required": "{fields} required.",
+    "already_exists": "This {resource} already exists.",
+    "unauthenticated": "Authentication required.",
+    "invalid_token": "Invalid or expired token.",
+    "forbidden": "Forbidden: {detail}",
+    "oidc_not_configured": "Single sign-on is not configured on this server.",
+    "fallback": "Something went wrong. Please try again."
+  },
+  "approval": {
+    "already_decided": "This request has already been decided.",
+    "already_executed": "This request has already been executed — an approved query runs exactly once.",
+    "exactly_one_source_required": "Provide either a source decision or a datasource and SQL, not both.",
+    "no_policy_configured": "No query-approval policy is configured for this datasource.",
+    "no_sql": "This request has no SQL to run.",
+    "no_execute_role": "This request has no role to run under.",
+    "no_unreleased_result": "No unreleased result is held by you for this request.",
+    "not_approver": "You are not an approver for this request.",
+    "not_approved": "This request has not been approved.",
+    "only_denied_queries": "Only denied queries can be requested for approval.",
+    "role_required": "This request must specify an elevation role to run under.",
+    "pending_request_exists": "A pending request already exists for this decision.",
+    "query_failed": "Query execution failed.",
+    "execute_denied": "The query was denied at execution time.",
+    "canceled": "The execution was canceled.",
+    "cancel_forbidden": "You do not have permission to cancel this execution.",
+    "not_cancelable": "This execution is no longer running and cannot be canceled.",
+    "result_not_ready": "The result is not ready yet.",
+    "result_expired": "This result has expired.",
+    "result_storage_not_configured": "Result storage is not configured on this server.",
+    "result_view_denied": "You do not have permission to view this result.",
+    "use_query_approval_endpoint": "Query approvals are decided via /api/approvals/{id}."
+  },
+  "auth": {
+    "invalid_id_token": "Invalid ID token.",
+    "missing_renewal_token": "Missing bearer renewal token.",
+    "principal_deprovisioned": "This account has been deprovisioned.",
+    "session_window_expired": "Your session has expired or your account was deprovisioned. Please sign in again."
+  },
+  "datasource": {
+    "table_introspection_failed": "Table introspection failed: {detail}",
+    "schema_required": "A schema is required until the datasource is introspected (which captures a default schema).",
+    "reserved_tag": "The tag \"{tag}\" is reserved for system classification and can't be set on a column.",
+    "engine_immutable": "A datasource's engine can't be changed. Delete and re-create it to switch engines.",
+    "invalid_engine": "\"{engine}\" isn't a supported engine — use \"postgres\" or \"mysql\".",
+    "no_wire_cert": "This datasource's proxy has not advertised a TLS certificate.",
+    "not_connectable": "You do not have access to connect to this datasource.",
+    "wire_cert_unusable": "The stored certificate chain is not usable as a trust anchor. Re-register the proxy, then try again."
+  },
+  "group": {
+    "system_immutable": "This is a system-managed group and cannot be modified or deleted."
+  },
+  "role": {
+    "system_immutable": "This is a system-managed role and cannot be renamed or deleted."
+  },
+  "policy": {
+    "reserved_name": "The \"system:\" name prefix is reserved for built-in system policies and can't be used for a policy name.",
+    "system_immutable": "This is a system-managed policy and cannot be modified or deleted."
+  },
+  "mcp": {
+    "insufficient_scope": "The OAuth token does not include the required scope: {scope}.",
+    "idempotency_conflict": "This idempotency key was already used with different input.",
+    "principal_deactivated": "This account has been deprovisioned.",
+    "invalid_host": "The MCP request Host header does not match this resource.",
+    "invalid_origin": "The MCP request Origin is not allowed for this resource.",
+    "invalid_request": "The MCP tool input is invalid.",
+    "internal_error": "The MCP operation failed."
+  },
+  "device": {
+    "idp_unsupported": "Your identity provider does not support device authorization.",
+    "login_already_completed": "This device login has already been completed.",
+    "poll_denied": "Device sign-in was denied: {detail}",
+    "start_failed": "Failed to start device authorization.",
+    "unknown_or_expired_login": "Unknown or expired device login."
+  },
+  "task": {
+    "orphaned_on_restart": "Execution was interrupted by a control-plane restart.",
+    "upgraded_ambiguous_claim": "This upgraded task may already have executed and was failed closed."
+  },
+  "query": {
+    "failed": "Query failed: {detail}",
+    "no_proxy_attached": "No proxy is attached to this datasource.",
+    "proxy_timeout": "The proxy did not respond in time."
+  }
+}

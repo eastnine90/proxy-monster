@@ -1,0 +1,10 @@
+entity User;
+entity Request { approved: Bool, requester: User };
+// one per (result, column); frozen at execution when we evaluated role R:
+//   unmaskable   = R has ANY unmasked grant for this column
+//   requiredZone = the zone R's unmask needs ("" = unconditional)
+entity ResultColumn { request: Request, unmaskable: Bool, requiredZone: String };
+action "result.viewUnmasked" appliesTo {
+  principal: [User], resource: [ResultColumn],
+  context: { "network_zones": Set<String> }
+};

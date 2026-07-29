@@ -1,0 +1,46 @@
+monitor:
+  poll_interval: 90s
+  sign_interval: 1h
+  full_verify_interval: 1h
+  bucket: audit-worm-example
+  endpoint: http://localhost:9000
+  db_dsn_env: AUDITMON_DB_DSN
+  retention_days: 730
+  # exported statement is always SHA-256 (never text); full SQL stays in the DB row
+  signer:
+    type: filekey
+    key_path: /var/lib/auditmon/signer.key
+rules:
+  mass_export:
+    window: 10m
+    heuristic_max_broad_reads: 50
+    default: { rows: 100000 }
+    per_datasource:
+      example-mysql: { rows: 50000, bytes: 1073741824 }
+  bulk_pii:
+    window: 5m
+    max_pii_decisions: 200
+    max_distinct_pii_columns: 20
+  off_hours:
+    business_hours: "09:00-19:00 Asia/Seoul"
+    applies_to: [pii_read, write]
+  repeated_deny:
+    window: 5m
+    max_deny: 20
+alerts:
+  dedup_window: 15m
+  sinks:
+    - {
+        type: webhook,
+        url_env: SECOPS_WEBHOOK_URL,
+        min_severity: warn,
+        rules: ["*"],
+        timeout: 5s,
+        max_retries: 3,
+      }
+    - {
+        type: webhook,
+        url_env: SLACK_WEBHOOK_URL,
+        min_severity: critical,
+        format: slack,
+      }

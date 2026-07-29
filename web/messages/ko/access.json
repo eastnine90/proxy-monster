@@ -1,0 +1,92 @@
+{
+  "header": {
+    "title": "연결 토큰",
+    "subtitle": "프록시를 통해 연결하기 위한 시간 제한 자격 증명입니다. 토큰은 항상 만료되며, 영구적인 비밀 값은 없습니다."
+  },
+  "generate": "토큰 생성",
+  "modes": {
+    "oneShotTitle": "일회용 연결 비밀번호",
+    "oneShotBody": "토큰을 생성한 뒤 psql / mysql / DataGrip의 비밀번호란에 붙여넣으세요. 만료되면 더 이상 동작하지 않으며, 다음에는 새로 생성하면 됩니다.",
+    "brokerTitle": "로컬 브로커 (안정적인 연결)",
+    "brokerBody": "pmon login을 실행하세요. 데몬이 토큰을 보관하고 데이터소스별 로컬 포트를 열며, pmon show가 연결 문자열을 출력합니다. 아무 비밀번호로 해당 포트에 클라이언트를 연결하면 변하지 않는 연결 문자열을 그대로 사용할 수 있습니다. 토큰은 자동으로 갱신되지 않으므로, 만료되면 pmon login을 다시 실행하세요."
+  },
+  "loading": "토큰을 불러오는 중…",
+  "empty": {
+    "title": "아직 토큰이 없습니다.",
+    "hint": "연결 토큰을 생성하거나 pmon CLI로 발급하세요."
+  },
+  "section": {
+    "active": "활성",
+    "inactive": "만료 / 취소됨"
+  },
+  "table": {
+    "name": "이름",
+    "kind": "종류",
+    "status": "상태",
+    "lastUsed": "마지막 사용",
+    "actions": "작업"
+  },
+  "kind": {
+    "broker": "브로커",
+    "connect": "연결"
+  },
+  "name": {
+    "daemonSession": "데몬 세션",
+    "unnamed": "이름 없음"
+  },
+  "lastUsed": {
+    "never": "없음",
+    "justNow": "방금 전",
+    "minutesAgo": "{minutes}분 전",
+    "hoursAgo": "{hours}시간 전"
+  },
+  "expiry": {
+    "revoked": "취소됨",
+    "expired": "만료됨",
+    "inMinutes": "{minutes}분 후 만료",
+    "inHours": "{hours}시간 후 만료",
+    "onDate": "{date} 만료"
+  },
+  "revoke": {
+    "action": "취소",
+    "success": "토큰이 취소되었습니다.",
+    "failed": "취소 실패"
+  },
+  "countdown": {
+    "noExpiry": "만료 없음",
+    "expired": "만료됨"
+  },
+  "reject": {
+    "title": "요청 거절",
+    "descriptionQuery": "{principal}의 쿼리 요청을 거절합니다.",
+    "descriptionAccess": "{principal}의 \"{role}\" 역할에 대한 접근 요청을 거절합니다.",
+    "descriptionFallback": "접근 요청을 거절합니다.",
+    "failed": "거절에 실패했습니다.",
+    "reasonLabel": "사유 (필수)",
+    "reasonPlaceholder": "범위가 너무 넓습니다 — orders/customers로 좁혀서 다시 요청해 주세요.",
+    "cancel": "취소",
+    "submit": "거절",
+    "submitting": "거절 중…"
+  },
+  "directConnect": {
+    "title": "SQL 클라이언트로 직접 연결",
+    "intro": "pmon을 사용하는 방법을 권장합니다. 짧은 수명의 토큰을 중계하고 프록시 인증서를 자동으로 고정합니다. psql, mysql, DataGrip을 프록시에 직접 연결하려면 아래 정보를 사용하세요.",
+    "noneConnectable": "연결할 수 있는 데이터소스가 없습니다.",
+    "noAddress": "이 데이터소스의 프록시가 클라이언트용 주소를 아직 알리지 않았습니다.",
+    "tls": "TLS",
+    "tlsOn": "사용 중입니다. 인증서를 내려받아 클라이언트에 지정하세요.",
+    "tlsSystemTrust": "사용 중입니다. 이 프록시는 공개적으로 신뢰되는 인증서를 사용하며 별도로 배포하지 않으므로, 클라이언트가 자체 신뢰 저장소로 검증합니다. 인증서 파일이 필요하지 않습니다.",
+    "tlsOff": "이 프록시에서 사용하지 않습니다. 직접 연결하면 암호화되지 않으므로, 신뢰할 수 있는 네트워크에서 pmon을 사용하세요.",
+    "download": "인증서 내려받기",
+    "downloadFailed": "인증서를 내려받지 못했습니다",
+    "rotationNote": "프록시 인증서를 교체하면 내려받은 사본은 더 이상 사용할 수 없습니다. 교체 후 다시 내려받으세요.",
+    "verifyModeNote": "verify-full은 인증서와 함께 연결한 주소가 인증서에 포함되는지도 확인합니다. 인증서가 그 주소를 포함하지 않으면(일치하는 호스트 이름이나 IP SAN이 없으면) verify-ca로 낮추세요. 인증서는 계속 검증하고 신원만 확인하지 않습니다.",
+    "copy": "복사",
+    "clients": {
+      "psql": "psql",
+      "mysql": "mysql",
+      "datagrip": "DataGrip"
+    },
+    "datagripHelp": "DataGrip에서: Data Sources → 연결 → SSH/SSL → Use SSL을 켜고, CA file에 내려받은 인증서를, Mode에 {mode}를 지정하세요."
+  }
+}

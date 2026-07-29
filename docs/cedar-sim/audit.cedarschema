@@ -1,0 +1,5 @@
+entity Role;
+entity User in [Role];
+entity AuditRecord { principal: User };
+entity AuditLog;
+action "audit.read" appliesTo { principal: [User], resource: [AuditRecord, AuditLog] };
