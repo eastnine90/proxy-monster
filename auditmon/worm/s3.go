@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -15,19 +14,16 @@ import (
 )
 
 // S3Config configures an S3-compatible WORM bucket. Endpoint + UsePathStyle target MinIO/on-prem;
-// RetentionDays > 0 applies an Object-Lock COMPLIANCE retention on every Put.
 type S3Config struct {
-	Bucket        string
-	Endpoint      string
-	Region        string
-	RetentionDays int
-	UsePathStyle  bool
+	Bucket       string
+	Endpoint     string
+	Region       string
+	UsePathStyle bool
 }
 
 type s3Store struct {
-	client        *s3.Client
-	bucket        string
-	retentionDays int
+	client *s3.Client
+	bucket string
 }
 
 // NewS3 builds an S3-backed ObjectStore. Credentials/region come from the ambient AWS config
@@ -50,7 +46,7 @@ func NewS3(ctx context.Context, cfg S3Config) (ObjectStore, error) {
 			o.UsePathStyle = true
 		}
 	})
-	return &s3Store{client: client, bucket: cfg.Bucket, retentionDays: cfg.RetentionDays}, nil
+	return &s3Store{client: client, bucket: cfg.Bucket}, nil
 }
 
 func (s *s3Store) Put(key string, body []byte) error {
@@ -58,11 +54,6 @@ func (s *s3Store) Put(key string, body []byte) error {
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 		Body:   bytes.NewReader(body),
-	}
-	if s.retentionDays > 0 {
-		until := time.Now().AddDate(0, 0, s.retentionDays)
-		in.ObjectLockMode = types.ObjectLockModeCompliance
-		in.ObjectLockRetainUntilDate = aws.Time(until)
 	}
 	if _, err := s.client.PutObject(context.Background(), in); err != nil {
 		return fmt.Errorf("worm: put %q: %w", key, err)

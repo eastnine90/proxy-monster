@@ -94,9 +94,8 @@ func run() error {
 	}
 
 	objStore, err := worm.NewS3(ctx, worm.S3Config{
-		Bucket:        cfg.Monitor.Bucket,
-		Endpoint:      cfg.Monitor.Endpoint,
-		RetentionDays: cfg.Monitor.RetentionDays,
+		Bucket:   cfg.Monitor.Bucket,
+		Endpoint: cfg.Monitor.Endpoint,
 	})
 	if err != nil {
 		return err

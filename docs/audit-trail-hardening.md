@@ -261,7 +261,6 @@ monitor:
   bucket: audit-worm-example
   endpoint: http://localhost:9000 # optional S3-compatible endpoint (e.g. MinIO)
   db_dsn_env: AUDITMON_DB_DSN
-  retention_days: 730
   # exported statement is always SHA-256 (never text); full SQL stays in the DB row
   signer:
     type: filekey # or kms
@@ -334,9 +333,9 @@ still lands in WORM + SIEM.
   `events/` (batched NDJSON audit events the SIEM ingests,
   `events/<firstID>-<lastID>.ndjson`), `alerts/` (immutable alert objects). The
   monitor's export position is derived from the bucket (last `events/` object)
-  plus its own local state, no DB cursor. Defaults: retention 730 days
-  (`retention_days`), compliance mode; both configurable (governance mode is an
-  explicit, documented downgrade that would let an insider delete).
+  plus its own local state, no DB cursor. Retention is the bucket's own default
+  Object-Lock policy — the monitor sets none per object, so the mode and
+  duration are declared where the bucket is.
 - DB roles — a runtime role you provision (audit tables: `INSERT, SELECT`)
   distinct from the migration owner. No migration creates or grants it;
   unconfigured, `PM_DB_USER` is both writer and owner.

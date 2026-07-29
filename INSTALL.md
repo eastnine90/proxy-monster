@@ -197,7 +197,6 @@ monitor:
   poll_interval: 90s
   sign_interval: 1h
   full_verify_interval: 1h
-  retention_days: 730
   signer:
     type: kms # prod signer (dev: filekey + key_path)
     key_id: alias/pm-audit-signer
@@ -605,8 +604,9 @@ for the store; S3 Object Lock for the WORM trail.
   always PostgreSQL regardless of what the proxied target databases run.
   `PM_DB_URL` → writer endpoint. Give auditmon the reader endpoint + a
   `SELECT`-only role.
-- S3 bucket, Object Lock (compliance) — auditmon's WORM store; default retention
-  = `retention_days`; reached via the S3 gateway endpoint.
+- S3 bucket, Object Lock — auditmon's WORM store. Retention is the bucket's own
+  default policy; the monitor sets none per object. Reached via the S3 gateway
+  endpoint.
 - KMS — an asymmetric key for auditmon's anchor signer (`signer.type: kms`).
 - ACM / wire TLS — a public ACM cert on the ALB (console HTTPS). For the SQL
   wire, prefer a private transport (internal NLB via PrivateLink or the peered

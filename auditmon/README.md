@@ -186,7 +186,6 @@ monitor:
   bucket: audit-worm-example
   endpoint: http://localhost:9000 # MinIO for local dev (path-style)
   db_dsn_env: AUDITMON_DB_DSN # names the env var holding the read-only DSN
-  retention_days: 730 # 2yr Object-Lock compliance retention
   signer:
     type: filekey # dev: ed25519 key on disk (0600, generated if absent)
     key_path: ./auditmon-signer.key

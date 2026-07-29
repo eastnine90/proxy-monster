@@ -190,7 +190,6 @@ type MonitorConfig struct {
 	KMSKeyID           string        `koanf:"kms_key_id"`
 	DBDSNEnv           string        `koanf:"db_dsn_env"`
 	Signer             SignerConfig  `koanf:"signer"`
-	RetentionDays      int           `koanf:"retention_days"`
 }
 
 // SignerConfig selects and configures the anchor signer. AllowedKeyIDs are prior key ids still trusted for
@@ -213,14 +212,12 @@ var envKeyMap = map[string]string{
 	"AUDITMON_MONITOR_ENDPOINT":             "monitor.endpoint",
 	"AUDITMON_MONITOR_KMS_KEY_ID":           "monitor.kms_key_id",
 	"AUDITMON_MONITOR_DB_DSN_ENV":           "monitor.db_dsn_env",
-	"AUDITMON_MONITOR_RETENTION_DAYS":       "monitor.retention_days",
 	"AUDITMON_MONITOR_SIGNER_TYPE":          "monitor.signer.type",
 	"AUDITMON_MONITOR_SIGNER_KEY_PATH":      "monitor.signer.key_path",
 	"AUDITMON_MONITOR_SIGNER_KEY_ID":        "monitor.signer.key_id",
 }
 
 const (
-	defaultRetentionDays      = 730 // 2 years
 	defaultDedupWindow        = 15 * time.Minute
 	defaultFullVerifyInterval = time.Hour
 	// The cadences INSTALL.md and the README already document. Defaulted rather than required so a
@@ -261,9 +258,6 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: unmarshal: %w", err)
 	}
 
-	if cfg.Monitor.RetentionDays == 0 {
-		cfg.Monitor.RetentionDays = defaultRetentionDays
-	}
 	if cfg.Monitor.FullVerifyInterval == 0 {
 		cfg.Monitor.FullVerifyInterval = defaultFullVerifyInterval
 	}

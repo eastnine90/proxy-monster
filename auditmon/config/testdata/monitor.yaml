@@ -5,7 +5,6 @@ monitor:
   bucket: audit-worm-example
   endpoint: http://localhost:9000
   db_dsn_env: AUDITMON_DB_DSN
-  retention_days: 730
   # exported statement is always SHA-256 (never text); full SQL stays in the DB row
   signer:
     type: filekey

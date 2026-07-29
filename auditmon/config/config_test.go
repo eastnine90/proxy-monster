@@ -32,15 +32,11 @@ func TestLoadParsesYAML(t *testing.T) {
 	if m.Signer.Type != "filekey" || m.Signer.KeyPath != "/var/lib/auditmon/signer.key" {
 		t.Errorf("signer = %+v", m.Signer)
 	}
-	if m.RetentionDays != 730 {
-		t.Errorf("retention_days = %d, want 730", m.RetentionDays)
-	}
 }
 
 func TestEnvOverrideWins(t *testing.T) {
 	t.Setenv("AUDITMON_MONITOR_POLL_INTERVAL", "30s")
 	t.Setenv("AUDITMON_MONITOR_BUCKET", "override-bucket")
-	t.Setenv("AUDITMON_MONITOR_RETENTION_DAYS", "365")
 
 	cfg, err := Load(filepath.Join("testdata", "monitor.yaml"))
 	if err != nil {
@@ -51,9 +47,6 @@ func TestEnvOverrideWins(t *testing.T) {
 	}
 	if cfg.Monitor.Bucket != "override-bucket" {
 		t.Errorf("bucket = %q, want the env override", cfg.Monitor.Bucket)
-	}
-	if cfg.Monitor.RetentionDays != 365 {
-		t.Errorf("retention_days = %d, want the env override 365", cfg.Monitor.RetentionDays)
 	}
 }
 
@@ -343,9 +336,6 @@ func TestEveryDefaultableSettingHasADefault(t *testing.T) {
 	}
 	if cfg.Monitor.FullVerifyInterval != time.Hour {
 		t.Errorf("full_verify_interval = %v, want the 1h default", cfg.Monitor.FullVerifyInterval)
-	}
-	if cfg.Monitor.RetentionDays != 730 {
-		t.Errorf("retention_days = %d, want 730", cfg.Monitor.RetentionDays)
 	}
 	// The signer falls back to filekey, never kms: a kms default would be a key id this install does not
 	// own, and signing an anchor with the wrong key is worse than signing with a local one.
