@@ -5,7 +5,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/url"
 	"os"
@@ -221,6 +223,16 @@ const (
 	defaultRetentionDays      = 730 // 2 years
 	defaultDedupWindow        = 15 * time.Minute
 	defaultFullVerifyInterval = time.Hour
+	// The cadences INSTALL.md and the README already document. Defaulted rather than required so a
+	// deployment that configures only what is install-specific — the store, the bucket, the signing key —
+	// boots and monitors. A monitor that refuses to start is worth strictly less than one polling at a
+	// sensible cadence, and every value here is overridable.
+	defaultPollInterval = 90 * time.Second
+	defaultSignInterval = time.Hour
+	// filekey is the dev signer; a real deployment sets signer.type: kms and a key id. Choosing filekey as
+	// the default keeps the fallback the one that cannot silently sign with someone else's key.
+	defaultSignerType    = "filekey"
+	defaultSignerKeyPath = "/var/lib/auditmon/signer.key"
 )
 
 // Load reads the YAML file, overlays AUDITMON_ environment variables, applies defaults, and validates.
@@ -228,7 +240,12 @@ const (
 func Load(path string) (*Config, error) {
 	k := koanf.New(".")
 
-	if err := k.Load(file.Provider(path), yaml.Parser()); err != nil {
+	// A MISSING file is not an error: the image ships no config on purpose (it varies per install), so a
+	// deployment that supplies everything through AUDITMON_* has no file to mount. Any other failure —
+	// unreadable, malformed YAML — still fails closed, because that is a config the operator meant to
+	// provide and got wrong. Validate below rejects whatever the overlay leaves incomplete, so an absent
+	// file cannot silently boot a half-configured monitor.
+	if err := k.Load(file.Provider(path), yaml.Parser()); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("config: load %s: %w", path, err)
 	}
 
@@ -252,6 +269,18 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Alerts.DedupWindow == 0 {
 		cfg.Alerts.DedupWindow = defaultDedupWindow
+	}
+	if cfg.Monitor.PollInterval == 0 {
+		cfg.Monitor.PollInterval = defaultPollInterval
+	}
+	if cfg.Monitor.SignInterval == 0 {
+		cfg.Monitor.SignInterval = defaultSignInterval
+	}
+	if cfg.Monitor.Signer.Type == "" {
+		cfg.Monitor.Signer.Type = defaultSignerType
+	}
+	if cfg.Monitor.Signer.Type == defaultSignerType && cfg.Monitor.Signer.KeyPath == "" {
+		cfg.Monitor.Signer.KeyPath = defaultSignerKeyPath
 	}
 
 	if err := cfg.Validate(); err != nil {

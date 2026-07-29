@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -264,5 +265,128 @@ func TestDBDSNRejectsIncompleteParameters(t *testing.T) {
 				t.Errorf("error should name %s, got: %v", tc.want, err)
 			}
 		})
+	}
+}
+
+func TestLoadWithoutAConfigFile(t *testing.T) {
+	// The image ships no config on purpose, so a deployment that supplies everything through
+	// AUDITMON_* has no file to mount. This is the case that crash-looped the ECS task: Load hard-failed
+	// on the absent default path before the env overlay was ever applied, so the monitor exited every
+	// ~50s while the service reported "running".
+	t.Setenv("AUDITMON_MONITOR_POLL_INTERVAL", "90s")
+	t.Setenv("AUDITMON_MONITOR_SIGN_INTERVAL", "1h")
+	t.Setenv("AUDITMON_MONITOR_BUCKET", "audit-worm")
+	t.Setenv("AUDITMON_MONITOR_SIGNER_TYPE", "kms")
+	t.Setenv("AUDITMON_MONITOR_SIGNER_KEY_ID", "alias/pm-audit-signer")
+
+	cfg, err := Load(filepath.Join(t.TempDir(), "absent.yaml"))
+	if err != nil {
+		t.Fatalf("an absent config file must not fail the load: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("env-only configuration must validate: %v", err)
+	}
+	if cfg.Monitor.Bucket != "audit-worm" {
+		t.Errorf("bucket = %q, want the env value", cfg.Monitor.Bucket)
+	}
+	if cfg.Monitor.PollInterval.String() != "1m30s" {
+		t.Errorf("poll_interval = %v, want 90s from the env overlay", cfg.Monitor.PollInterval)
+	}
+}
+
+func TestLoadStillFailsOnAMalformedConfigFile(t *testing.T) {
+	// Tolerating an ABSENT file must not tolerate a BROKEN one: a file the operator meant to provide and
+	// got wrong has to fail closed, or a typo silently boots on defaults.
+	path := filepath.Join(t.TempDir(), "bad.yaml")
+	if err := os.WriteFile(path, []byte("monitor: [this is not a mapping\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected a malformed config file to fail the load")
+	}
+}
+
+func TestValidateRejectsEnvOnlyConfigThatIsIncomplete(t *testing.T) {
+	// The absent-file path leans entirely on Validate to catch what the overlay left out — without that,
+	// a missing file plus a missing variable would boot a half-configured monitor.
+	t.Setenv("AUDITMON_MONITOR_POLL_INTERVAL", "90s")
+	t.Setenv("AUDITMON_MONITOR_SIGN_INTERVAL", "1h")
+	// no bucket, no signer
+
+	// Load validates before returning, so the incompleteness surfaces there rather than from a separate
+	// Validate call — an absent file cannot boot a half-configured monitor.
+	_, err := Load(filepath.Join(t.TempDir(), "absent.yaml"))
+	if err == nil {
+		t.Fatal("expected a configuration with no bucket and no signer to be rejected")
+	}
+	if !strings.Contains(err.Error(), "bucket") {
+		t.Errorf("error should name the missing setting, got: %v", err)
+	}
+}
+
+func TestEveryDefaultableSettingHasADefault(t *testing.T) {
+	// A deployment should have to supply only what is install-specific. Everything with a sane default
+	// gets one, so a missing knob cannot be the reason an audit monitor fails to start — that failure
+	// looks identical to "nothing to report".
+	t.Setenv("AUDITMON_MONITOR_BUCKET", "audit-worm")
+
+	cfg, err := Load(filepath.Join(t.TempDir(), "absent.yaml"))
+	if err != nil {
+		t.Fatalf("bucket alone should be enough to boot: %v", err)
+	}
+	// The documented cadences (INSTALL.md, README).
+	if cfg.Monitor.PollInterval != 90*time.Second {
+		t.Errorf("poll_interval = %v, want the 90s default", cfg.Monitor.PollInterval)
+	}
+	if cfg.Monitor.SignInterval != time.Hour {
+		t.Errorf("sign_interval = %v, want the 1h default", cfg.Monitor.SignInterval)
+	}
+	if cfg.Monitor.FullVerifyInterval != time.Hour {
+		t.Errorf("full_verify_interval = %v, want the 1h default", cfg.Monitor.FullVerifyInterval)
+	}
+	if cfg.Monitor.RetentionDays != 730 {
+		t.Errorf("retention_days = %d, want 730", cfg.Monitor.RetentionDays)
+	}
+	// The signer falls back to filekey, never kms: a kms default would be a key id this install does not
+	// own, and signing an anchor with the wrong key is worse than signing with a local one.
+	if cfg.Monitor.Signer.Type != "filekey" {
+		t.Errorf("signer.type = %q, want the filekey default", cfg.Monitor.Signer.Type)
+	}
+	if cfg.Monitor.Signer.KeyPath == "" {
+		t.Error("the filekey default must come with a key_path, or Validate rejects it")
+	}
+}
+
+func TestBucketRemainsRequired(t *testing.T) {
+	// The one setting with no defensible default: guessing a bucket name would either fail at write time
+	// or, worse, write an install's audit anchors into a bucket it does not own.
+	if _, err := Load(filepath.Join(t.TempDir(), "absent.yaml")); err == nil {
+		t.Fatal("expected a config with no bucket to be rejected")
+	} else if !strings.Contains(err.Error(), "bucket") {
+		t.Errorf("error should name the bucket, got: %v", err)
+	}
+}
+
+func TestExplicitValuesWinOverDefaults(t *testing.T) {
+	// Defaults must not shadow configuration — the ECS task passes several of these explicitly.
+	t.Setenv("AUDITMON_MONITOR_BUCKET", "audit-worm")
+	t.Setenv("AUDITMON_MONITOR_POLL_INTERVAL", "5s")
+	t.Setenv("AUDITMON_MONITOR_SIGN_INTERVAL", "30s")
+	t.Setenv("AUDITMON_MONITOR_SIGNER_TYPE", "kms")
+	t.Setenv("AUDITMON_MONITOR_SIGNER_KEY_ID", "alias/pm-audit-signer")
+
+	cfg, err := Load(filepath.Join(t.TempDir(), "absent.yaml"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Monitor.PollInterval != 5*time.Second || cfg.Monitor.SignInterval != 30*time.Second {
+		t.Errorf("explicit intervals lost: poll=%v sign=%v", cfg.Monitor.PollInterval, cfg.Monitor.SignInterval)
+	}
+	if cfg.Monitor.Signer.Type != "kms" || cfg.Monitor.Signer.KeyID != "alias/pm-audit-signer" {
+		t.Errorf("explicit kms signer lost: %+v", cfg.Monitor.Signer)
+	}
+	// The filekey default key_path must NOT be filled in for a kms signer.
+	if cfg.Monitor.Signer.KeyPath != "" {
+		t.Errorf("key_path = %q, want empty for a kms signer", cfg.Monitor.Signer.KeyPath)
 	}
 }
