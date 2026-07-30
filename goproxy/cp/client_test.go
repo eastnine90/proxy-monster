@@ -613,11 +613,10 @@ func TestStreamEventsEndsAtItsMaxAge(t *testing.T) {
 	fake := &holdOpenControlPlane{done: make(chan struct{})}
 	c := startHoldOpenControlPlane(t, fake)
 
-	restore := eventsStreamMaxAgeForTest(300 * time.Millisecond)
-	defer restore()
-
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	start := time.Now()
-	err := c.StreamEvents(func() {}, func(spi.RunOpen) {}, func(string, string, string) {})
+	err := c.streamEvents(ctx, 300*time.Millisecond, func() {}, func(spi.RunOpen) {}, func(string, string, string) {})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -637,12 +636,19 @@ func TestEventsLoopReopensAfterMaxAge(t *testing.T) {
 	fake := &holdOpenControlPlane{done: make(chan struct{})}
 	c := startHoldOpenControlPlane(t, fake)
 
-	restore := eventsStreamMaxAgeForTest(150 * time.Millisecond)
-	defer restore()
-	restoreBackoff := eventsReconnectForTest(10 * time.Millisecond)
-	defer restoreBackoff()
-
-	go c.RunEventsLoop(func() {}, func() {}, func(spi.RunOpen) {}, func(string, string, string) {})
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		c.runEventsLoop(ctx, eventLoopTimings{
+			streamMaxAge: 150 * time.Millisecond,
+			reconnect:    10 * time.Millisecond,
+		}, func() {}, func() {}, func(spi.RunOpen) {}, func(string, string, string) {})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-loopDone
+	})
 
 	deadline := time.After(5 * time.Second)
 	for {
@@ -664,17 +670,24 @@ func TestEventsLoopReopensWithoutWaitingForResync(t *testing.T) {
 	fake := &holdOpenControlPlane{done: make(chan struct{})}
 	c := startHoldOpenControlPlane(t, fake)
 
-	restore := eventsStreamMaxAgeForTest(150 * time.Millisecond)
-	defer restore()
-	restoreBackoff := eventsReconnectForTest(10 * time.Millisecond)
-	defer restoreBackoff()
-
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
 	blocked := make(chan struct{})
-	go c.RunEventsLoop(
-		func() { <-blocked }, // a resync that never finishes
-		func() {}, func(spi.RunOpen) {}, func(string, string, string) {},
-	)
-	defer close(blocked)
+	resync := func() {
+		<-blocked // every background resync stays blocked until test cleanup releases it
+	}
+	go func() {
+		defer close(loopDone)
+		c.runEventsLoop(ctx, eventLoopTimings{
+			streamMaxAge: 150 * time.Millisecond,
+			reconnect:    10 * time.Millisecond,
+		}, resync, func() {}, func(spi.RunOpen) {}, func(string, string, string) {})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-loopDone
+		close(blocked) // release the background resync goroutines after the loop exits
+	})
 
 	deadline := time.After(5 * time.Second)
 	for {
