@@ -470,9 +470,6 @@ func (c *Client) runEventsLoop(
 	onOpenTableDetail func(sessionID, schema, table string),
 ) {
 	for {
-		if err := ctx.Err(); err != nil {
-			return
-		}
 		err := c.streamEvents(ctx, timings.streamMaxAge, onRefresh, onOpenRun, onOpenTableDetail)
 		// An expiry is the bounded rotation working, not a fault, so it should not read as one in the log.
 		if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
@@ -480,18 +477,13 @@ func (c *Client) runEventsLoop(
 		} else {
 			slog.Info("events stream ended; reconnecting", "error", err, "reconnect_in", timings.reconnect)
 		}
-		timer := time.NewTimer(timings.reconnect)
+
 		select {
 		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
 			return
-		case <-timer.C:
+		case <-time.After(timings.reconnect):
 		}
-		if err := ctx.Err(); err != nil {
-			return
-		}
+
 		go resync()
 	}
 }
