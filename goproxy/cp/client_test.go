@@ -701,3 +701,80 @@ func TestEventsLoopReopensWithoutWaitingForResync(t *testing.T) {
 		}
 	}
 }
+
+// refusingControlPlane fails every Events call immediately, standing in for a control plane that is
+// reachable but not serving — the shape a restart or a rollout takes from the proxy's side.
+type refusingControlPlane struct {
+	pb.UnimplementedControlPlaneServer
+	mu    sync.Mutex
+	opens []time.Time
+}
+
+func (f *refusingControlPlane) Events(_ *pb.EventsRequest, _ grpc.ServerStreamingServer[pb.ControlEvent]) error {
+	f.mu.Lock()
+	f.opens = append(f.opens, time.Now())
+	f.mu.Unlock()
+	return status.Error(codes.Unavailable, "not serving")
+}
+
+func (f *refusingControlPlane) openTimes() []time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]time.Time(nil), f.opens...)
+}
+
+func TestEventsLoopWaitsTheBackoffBetweenReopens(t *testing.T) {
+	// A stream that fails to open returns immediately, so the backoff is the only thing pacing the loop.
+	// Without it a control plane that is down turns into a hot reconnect loop that also launches a
+	// catalog-introspecting resync per iteration. Asserting that reopens happen is not enough to catch
+	// that: the reopens still happen, just unboundedly fast.
+	const backoff = 120 * time.Millisecond
+
+	fake := &refusingControlPlane{}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := grpc.NewServer()
+	pb.RegisterControlPlaneServer(server, fake)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(server.Stop)
+
+	c, err := New(listener.Addr().String(), "secret-abc", "ds-1")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		c.runEventsLoop(ctx, eventLoopTimings{
+			streamMaxAge: time.Minute, // long enough that only the backoff paces this test
+			reconnect:    backoff,
+		}, func() {}, func() {}, func(spi.RunOpen) {}, func(string, string, string) {})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-loopDone
+	})
+
+	deadline := time.After(5 * time.Second)
+	for len(fake.openTimes()) < 3 {
+		select {
+		case <-deadline:
+			t.Fatalf("only %d opens against a refusing control plane — the loop is not reopening", len(fake.openTimes()))
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// Compare against the whole backoff rather than a fraction of it: the gap is the wait plus the failed
+	// RPC, so it can only run long. A loop that skipped the wait would show gaps near zero.
+	opens := fake.openTimes()
+	for i := 1; i < len(opens); i++ {
+		if gap := opens[i].Sub(opens[i-1]); gap < backoff {
+			t.Fatalf("reopen %d came %v after the previous one, faster than the %v backoff", i, gap, backoff)
+		}
+	}
+}
