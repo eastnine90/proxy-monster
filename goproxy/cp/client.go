@@ -41,7 +41,7 @@ const (
 	rpcDeadline = 30 * time.Second
 	// secretTokenHeader is the shared transport secret header the control plane expects.
 	secretTokenHeader = "x-pm-secret-token"
-	// eventsReconnect is the backoff between Events stream reconnect attempts.
+	// eventsReconnectDefault is the backoff between Events stream reconnect attempts.
 	eventsReconnectDefault = 5 * time.Second
 	// eventsStreamMaxAge bounds how long one Events stream is used before it is replaced. HTTP/2 keepalive
 	// proves the CONNECTION is alive, not that the stream on it still reaches a live control plane: a
@@ -58,22 +58,16 @@ const (
 	keepaliveTimeout = 10 * time.Second
 )
 
-// Overridable only so tests can shorten them; production always uses the defaults above.
-var (
-	eventsReconnect    = eventsReconnectDefault
-	eventsStreamMaxAge = eventsStreamMaxAgeDefault
-)
-
-func eventsStreamMaxAgeForTest(d time.Duration) func() {
-	prev := eventsStreamMaxAge
-	eventsStreamMaxAge = d
-	return func() { eventsStreamMaxAge = prev }
+type eventLoopTimings struct {
+	reconnect    time.Duration
+	streamMaxAge time.Duration
 }
 
-func eventsReconnectForTest(d time.Duration) func() {
-	prev := eventsReconnect
-	eventsReconnect = d
-	return func() { eventsReconnect = prev }
+func defaultEventLoopTimings() eventLoopTimings {
+	return eventLoopTimings{
+		reconnect:    eventsReconnectDefault,
+		streamMaxAge: eventsStreamMaxAgeDefault,
+	}
 }
 
 // Client is the proxy's gRPC client to the control plane. It satisfies engine.Decider.
@@ -399,7 +393,7 @@ func (c *Client) CloseConnection(connectionID []byte) error {
 // StreamEvents opens the proxy-initiated Events stream and dispatches refresh/run/table-detail
 // nudges until the stream ends or errors. Blocks the calling goroutine for the stream's lifetime.
 //
-// Bounded by eventsStreamMaxAge rather than left open indefinitely. The open stream IS the liveness
+// Bounded by eventsStreamMaxAgeDefault rather than left open indefinitely. The open stream IS the liveness
 // signal the control plane reads, so a stream that survives its control plane costs this datasource
 // every query until something ends it — and nothing here would, because keepalive only proves the
 // connection is alive. Expiry is a normal end: RunEventsLoop resyncs and reopens, and the control
@@ -409,7 +403,18 @@ func (c *Client) StreamEvents(
 	onOpenRun func(spi.RunOpen),
 	onOpenTableDetail func(sessionID, schema, table string),
 ) error {
-	ctx, cancel := context.WithTimeout(c.outCtx(context.Background()), eventsStreamMaxAge)
+	timings := defaultEventLoopTimings()
+	return c.streamEvents(context.Background(), timings.streamMaxAge, onRefresh, onOpenRun, onOpenTableDetail)
+}
+
+func (c *Client) streamEvents(
+	parent context.Context,
+	maxAge time.Duration,
+	onRefresh func(),
+	onOpenRun func(spi.RunOpen),
+	onOpenTableDetail func(sessionID, schema, table string),
+) error {
+	ctx, cancel := context.WithTimeout(c.outCtx(parent), maxAge)
 	defer cancel()
 	stream, err := c.stub.Events(ctx, &pb.EventsRequest{DatasourceName: c.datasourceName})
 	if err != nil {
@@ -443,7 +448,7 @@ func (c *Client) StreamEvents(
 	}
 }
 
-// RunEventsLoop holds the Events stream open and never returns. On a drop it waits eventsReconnect,
+// RunEventsLoop holds the Events stream open and never returns. On a drop it waits eventsReconnectDefault,
 // resyncs (re-registers + re-pushes the catalog, so a control plane that restarted with lost state
 // re-learns this datasource) and reopens.
 //
@@ -457,15 +462,32 @@ func (c *Client) RunEventsLoop(
 	onOpenRun func(spi.RunOpen),
 	onOpenTableDetail func(sessionID, schema, table string),
 ) {
+	c.runEventsLoop(context.Background(), defaultEventLoopTimings(), resync, onRefresh, onOpenRun, onOpenTableDetail)
+}
+
+func (c *Client) runEventsLoop(
+	ctx context.Context,
+	timings eventLoopTimings,
+	resync func(),
+	onRefresh func(),
+	onOpenRun func(spi.RunOpen),
+	onOpenTableDetail func(sessionID, schema, table string),
+) {
 	for {
-		err := c.StreamEvents(onRefresh, onOpenRun, onOpenTableDetail)
+		err := c.streamEvents(ctx, timings.streamMaxAge, onRefresh, onOpenRun, onOpenTableDetail)
 		// An expiry is the bounded rotation working, not a fault, so it should not read as one in the log.
 		if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
-			slog.Info("events stream reached its max age; reopening", "max_age", eventsStreamMaxAge)
+			slog.Info("events stream reached its max age; reopening", "max_age", timings.streamMaxAge)
 		} else {
-			slog.Info("events stream ended; reconnecting", "error", err, "reconnect_in", eventsReconnect)
+			slog.Info("events stream ended; reconnecting", "error", err, "reconnect_in", timings.reconnect)
 		}
-		time.Sleep(eventsReconnect)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(timings.reconnect):
+		}
+
 		go resync()
 	}
 }

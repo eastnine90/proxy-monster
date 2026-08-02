@@ -238,6 +238,18 @@ for m in analyzer auditmon goproxy mysqlwire pmon; do
 done
 '''
 
+[tasks.test-go-race]
+description = "Go race-detector tests against one database version (defaults to the newest supported)"
+shell = "bash -c"
+# Keep the same module loop as `test-go`; only enable the race detector.
+run = '''
+set -euo pipefail
+for m in analyzer auditmon goproxy mysqlwire pmon; do
+  echo "=== $m ==="
+  (cd "$m" && go test -race ./...)
+done
+'''
+
 [tasks.test]
 description = "All tests against the newest supported database version — the local default"
 depends = ["test-jvm", "test-go"]
