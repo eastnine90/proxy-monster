@@ -27,6 +27,7 @@ class ApprovalResultAssumeMysqlDbTest {
     private val roleName = "system:production-pii-accessor"
     private val rawSsn = "987-65-4320"
     private val maskedSsn = "*******4320"
+    private var explainPolicyEnabled = false
 
     @BeforeAll
     fun setup() {
@@ -72,7 +73,7 @@ class ApprovalResultAssumeMysqlDbTest {
         context = AuthzContext(requesterIp = ip),
     )
 
-    private fun request() = AccessRequest(
+    private fun request(sql: String = "SELECT ssn FROM users") = AccessRequest(
         id = 1,
         principal = requester,
         roleId = roleId,
@@ -85,9 +86,61 @@ class ApprovalResultAssumeMysqlDbTest {
         executedBy = approver,
         createdAt = "2026-07-23T00:00:00Z",
         kind = "QUERY",
-        sql = "SELECT ssn FROM users",
+        sql = sql,
         executeAs = listOf(roleName),
         creatorKind = "WORKFLOW",
+    )
+
+    private fun ensureExplainPolicy() {
+        if (!explainPolicyEnabled) {
+            checkNotNull(fx.cedarPolicyStore.setEnabled(-262L, true, "test-enable-explain"))
+            explainPolicyEnabled = true
+        }
+    }
+
+    private fun viewExplain(
+        sql: String,
+        decrypted: DecryptedResult,
+        requesterIp: String = "100.100.1.10",
+    ): ResultViewDecision {
+        ensureExplainPolicy()
+        return decideResultView(
+            viewer = requester,
+            req = request(sql),
+            childSql = sql,
+            ds = datasource,
+            decrypted = decrypted,
+            callerContext = AuthzContext(requesterIp = requesterIp),
+            datasourceStore = fx.datasourceStore,
+            policyStore = fx.policyStore,
+            accessStore = fx.accessStore,
+            userGroupStore = fx.userGroupStore,
+            roleResolver = fx.roleResolver,
+            authz = fx.authz,
+            systemClassification = null,
+            channel = Channel.EDITOR,
+        )
+    }
+
+    private fun viewEditor(
+        sql: String,
+        decrypted: DecryptedResult,
+        requesterIp: String = "100.100.1.10",
+    ): ResultViewDecision = decideResultView(
+        viewer = requester,
+        req = request(),
+        childSql = sql,
+        ds = datasource,
+        decrypted = decrypted,
+        callerContext = AuthzContext(requesterIp = requesterIp),
+        datasourceStore = fx.datasourceStore,
+        policyStore = fx.policyStore,
+        accessStore = fx.accessStore,
+        userGroupStore = fx.userGroupStore,
+        roleResolver = fx.roleResolver,
+        authz = fx.authz,
+        systemClassification = null,
+        channel = Channel.EDITOR,
     )
 
     @Test
@@ -254,5 +307,38 @@ class ApprovalResultAssumeMysqlDbTest {
             channel = Channel.EDITOR,
         )
         assertIs<ResultViewDecision.Denied>(view)
+    }
+
+    @Test
+    fun `editor view returns an allowed explain plan with its backend-generated columns`() {
+        val stored = fx.execOnTarget("EXPLAIN SELECT id FROM users")
+        val allowed = assertIs<ResultViewDecision.Allowed>(
+            viewExplain("EXPLAIN SELECT id FROM users", DecryptedResult(stored.columns, stored.rows)),
+        )
+        assertEquals(stored.columns, allowed.columns)
+        assertEquals(stored.rows, allowed.rows)
+    }
+
+    @Test
+    fun `editor view denies an explain plan whose inner query would mask a protected column`() {
+        val stored = fx.execOnTarget("EXPLAIN SELECT ssn FROM users")
+        assertIs<ResultViewDecision.Denied>(
+            viewExplain("EXPLAIN SELECT ssn FROM users", DecryptedResult(stored.columns, stored.rows)),
+        )
+    }
+
+    @Test
+    fun `editor view returns an allowed explain analyze plan and denies the masked one`() {
+        val allowedStored = fx.execOnTarget("EXPLAIN ANALYZE SELECT id FROM users")
+        val allowed = assertIs<ResultViewDecision.Allowed>(
+            viewExplain("EXPLAIN ANALYZE SELECT id FROM users", DecryptedResult(allowedStored.columns, allowedStored.rows)),
+        )
+        assertEquals(allowedStored.columns, allowed.columns)
+        assertEquals(allowedStored.rows, allowed.rows)
+
+        val deniedStored = fx.execOnTarget("EXPLAIN ANALYZE SELECT ssn FROM users")
+        assertIs<ResultViewDecision.Denied>(
+            viewExplain("EXPLAIN ANALYZE SELECT ssn FROM users", DecryptedResult(deniedStored.columns, deniedStored.rows)),
+        )
     }
 }
