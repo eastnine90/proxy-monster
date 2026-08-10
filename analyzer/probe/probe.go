@@ -176,7 +176,7 @@ func probeParsed(root exp.Expression, eng engine, qualifySchema schema.Schema, n
 	// The success path sets Functions from calledFunctions() at the final return; this defer backfills them on
 	// any POST-PARSE failResult (p.root is set once parsing succeeds), so the control-plane can gate a
 	// dangerous function that hides in an unanalyzable statement — closing the residue where a resolved=false
-	// dangerous call took the sql.unanalyzable relay unGated. A pre-parse failure leaves p.root nil → no
+	// dangerous call took the exception.unanalyzable relay unGated. A pre-parse failure leaves p.root nil → no
 	// backfill (nothing parsed to walk). It only runs when Functions is empty, so a success is never touched.
 	defer func() {
 		if !out.Resolved && p.root != nil && len(out.Functions) == 0 {
@@ -593,6 +593,14 @@ func (p *prober) classifyWrite() *ProbeResult {
 			p.isWrite = true
 			p.analyzeQuery = nil
 		}
+	}
+	// A SELECT ... INTO anywhere — including one hoisted onto a set-operation root or buried in a union
+	// branch — writes to a file/variable/table the masker cannot reach, so its read columns are a
+	// non-maskable write payload, not maskable output. The KindSelect case catches the top-level form;
+	// this catches the set-operation form the switch does not.
+	if !p.isWrite && len(p.root.FindAll(exp.KindInto)) > 0 {
+		p.isWrite = true
+		p.analyzeQuery = nil
 	}
 	return nil
 }
