@@ -15,7 +15,10 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import java.time.Duration
+import com.ridi.oss.proxymonster.controlplane.RoleAssignmentInput
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -56,7 +59,6 @@ class NotificationServiceDbTest {
             queryResultStore = null,
             webBaseUrl = "https://console.example",
             disclosure = StatementDisclosure.FULL,
-            statementMaxChars = 10_000,
             defaultLocale = "en",
         )
     }
@@ -67,8 +69,14 @@ class NotificationServiceDbTest {
             denyReason = null, sourceDecisionId = null, reason = "r", title = "t", evaluatedDecision = "ALLOW",
         )
 
-    private fun enqueue(task: Long, event: NotificationEvent, recipient: String, transportName: String = "fake") {
-        fx.dataSource.connection.use { c -> store.enqueue(c, task, event, transportName, recipient) }
+    private fun enqueue(
+        task: Long,
+        event: NotificationEvent,
+        recipient: String,
+        kind: NotificationKind = NotificationKind.APPROVER,
+        transportName: String = "fake",
+    ) {
+        fx.dataSource.connection.use { c -> store.enqueue(c, task, event, transportName, recipient, kind) }
     }
 
     private fun statusOf(task: Long, event: NotificationEvent, recipient: String): String =
@@ -87,6 +95,126 @@ class NotificationServiceDbTest {
         }
     }
 
+    private fun countRows(task: Long, event: NotificationEvent, recipient: String): Int =
+        fx.dataSource.connection.use { c ->
+            c.prepareStatement("SELECT count(*) FROM notification_outbox WHERE task_id=? AND event=? AND recipient=?").use { ps ->
+                ps.setLong(1, task); ps.setString(2, event.wire); ps.setString(3, recipient)
+                ps.executeQuery().use { it.next(); it.getInt(1) }
+            }
+        }
+
+    private fun setHint(task: Long, value: Boolean?) {
+        fx.dataSource.connection.use { c ->
+            c.prepareStatement("UPDATE access_request SET statement_carries_protected_literal = ? WHERE id = ?").use { ps ->
+                if (value == null) ps.setNull(1, java.sql.Types.BOOLEAN) else ps.setBoolean(1, value)
+                ps.setLong(2, task); ps.executeUpdate()
+            }
+        }
+    }
+
+    private fun setStatus(task: Long, status: String) {
+        fx.dataSource.connection.use { c ->
+            c.prepareStatement("UPDATE access_request SET status = ? WHERE id = ?").use { ps ->
+                ps.setString(1, status); ps.setLong(2, task); ps.executeUpdate()
+            }
+        }
+    }
+
+    private fun adminRoleId(): Long = fx.policyStore.listRoles().first { it.name == "system:admin" }.id
+
+    private fun serviceWith(disclosure: StatementDisclosure, candidates: List<String> = emptyList()) =
+        NotificationService(
+            store = store,
+            recipients = RecipientResolver(fx.authz, fx.roleResolver) { candidates },
+            transports = listOf(transport),
+            accessStore = fx.accessStore,
+            queryResultStore = null,
+            webBaseUrl = "https://console.example",
+            disclosure = disclosure,
+            defaultLocale = "en",
+        )
+
+    @Test
+    fun `emitRequested sends the requester a receipt and never routes them the approver message`() {
+        val task = newTask(principal = "req@example.com").id
+        fx.dataSource.connection.use { c ->
+            svc.emitRequested(c, task, "req@example.com", fx.datasource, roleName = null)
+        }
+        // The requester always gets a task.submitted receipt (here with no approvers, the candidate source is
+        // empty) — and never a task.requested addressed to themselves, whatever routing would resolve.
+        assertEquals("PENDING", statusOf(task, NotificationEvent.TASK_SUBMITTED, "req@example.com"))
+        assertEquals(0, countRows(task, NotificationEvent.TASK_REQUESTED, "req@example.com"))
+    }
+
+    @Test
+    fun `a self-approving requester gets BOTH the approver message and their own receipt`() = runBlocking {
+        // Policy lets the requester approve their own request, so recipientsFor (Cedar) returns them — never
+        // post-filtered. They are a plain recipient of both threads, and both are delivered, not deduped.
+        val requester = "self@example.com"
+        fx.policyStore.createAssignment(RoleAssignmentInput(requester, adminRoleId()))
+        val routing = serviceWith(StatementDisclosure.AUTO, candidates = listOf(requester))
+        val task = newTask(principal = requester).id
+        fx.dataSource.connection.use { c -> routing.emitRequested(c, task, requester, fx.datasource, roleName = null) }
+        routing.drainOnce()
+        val toRequester = transport.delivered.filter { it.to == "addr:$requester" }.map { it.event }.toSet()
+        assertEquals(
+            setOf(NotificationEvent.TASK_REQUESTED, NotificationEvent.TASK_SUBMITTED),
+            toRequester,
+            "the requester receives BOTH the approver message and their receipt — neither is deduped away",
+        )
+    }
+
+    @Test
+    fun `a terminal event updates both threads of a self-approving requester`() = runBlocking {
+        val requester = "self@example.com"
+        fx.policyStore.createAssignment(RoleAssignmentInput(requester, adminRoleId()))
+        val routing = serviceWith(StatementDisclosure.AUTO, candidates = listOf(requester))
+        val task = newTask(principal = requester).id
+        fx.dataSource.connection.use { c -> routing.emitRequested(c, task, requester, fx.datasource, roleName = null) }
+        routing.drainOnce() // both threads delivered, both refs remembered
+        transport.updated.clear()
+        val req = fx.accessStore.getRequest(task)!!
+        fx.dataSource.connection.use { c -> routing.emit(c, NotificationEvent.TASK_DECIDED, req) }
+        routing.drainOnce()
+        assertEquals(
+            2,
+            transport.updated.count { it.event == NotificationEvent.TASK_DECIDED },
+            "the decision edits both the approver-side message and the requester's receipt",
+        )
+    }
+
+    @Test
+    fun `the requester receipt lists the durable task-requested recipients and carries no statement`() = runBlocking {
+        val task = newTask(principal = "req@example.com").id
+        setHint(task, true) // even a flagged task: the receipt stays disclosure-free
+        // Two approvers were actually asked (durable rows). The candidate source is empty, so a receipt that
+        // recomputed eligibility would list nobody — asserting bob+carol proves it reads the outbox instead.
+        enqueue(task, NotificationEvent.TASK_REQUESTED, "bob@x")
+        enqueue(task, NotificationEvent.TASK_REQUESTED, "carol@x")
+        enqueue(task, NotificationEvent.TASK_SUBMITTED, "req@example.com", NotificationKind.REQUESTER)
+        svc.drainOnce()
+        val receipt = transport.delivered.single { it.event == NotificationEvent.TASK_SUBMITTED }
+        assertEquals(listOf("bob@x", "carol@x"), receipt.notifiedApprovers, "the receipt names who was actually asked")
+        assertNull(receipt.statement.text, "the requester's receipt never carries the statement")
+    }
+
+    @Test
+    fun `full shows a flagged statement while pending and hides it once the task is handled`() = runBlocking {
+        val task = newTask().id
+        setHint(task, true) // flagged: auto would withhold this
+        enqueue(task, NotificationEvent.TASK_REQUESTED, "bob@x")
+        svc.drainOnce() // svc is FULL
+        assertNotNull(transport.delivered.single().statement.text, "full shows a pending approver even a flagged statement")
+
+        // The same request, now handled, on a fresh (late/replayed) task.requested row: full falls back to the
+        // hint and withholds it, so a protected literal never surfaces for the first time after the decision.
+        setStatus(task, "REJECTED")
+        transport.delivered.clear()
+        enqueue(task, NotificationEvent.TASK_REQUESTED, "carol@x")
+        svc.drainOnce()
+        assertNull(transport.delivered.single().statement.text, "once handled, full hides a flagged statement even on a task.requested")
+    }
+
     @Test
     fun `drain delivers a pending notification and records its handle`() = runBlocking {
         val task = newTask().id
@@ -97,7 +225,7 @@ class NotificationServiceDbTest {
         assertEquals("addr:sam@x", transport.delivered.first().to)
         assertEquals(NotificationEvent.TASK_REQUESTED, transport.delivered.first().event)
         assertEquals("SENT", statusOf(task, NotificationEvent.TASK_REQUESTED, "sam@x"))
-        assertEquals("ref-fake", store.externalRef(task, "fake", "sam@x"), "the handle is remembered for later edits")
+        assertEquals("ref-fake", store.externalRef(task, "fake", "sam@x", NotificationKind.APPROVER), "the handle is remembered for later edits")
     }
 
     @Test
@@ -167,12 +295,12 @@ class NotificationServiceDbTest {
         enqueue(task, NotificationEvent.TASK_REQUESTED, "sam@x")
         // A prior attempt posted (ref recorded) but its markSent did not commit: the row is still PENDING, yet
         // a delivery handle already exists. Re-posting would double-send and strand the first message's buttons.
-        store.rememberMessage(task, "fake", "sam@x", "ref-prior")
+        store.rememberMessage(task, "fake", "sam@x", NotificationKind.APPROVER, "ref-prior")
         svc.drainOnce()
 
         assertTrue(transport.delivered.isEmpty(), "the existing ref is adopted; the message is not sent again")
         assertEquals("SENT", statusOf(task, NotificationEvent.TASK_REQUESTED, "sam@x"), "the row is finished, not left pending")
-        assertEquals("ref-prior", store.externalRef(task, "fake", "sam@x"), "the original handle is kept for later edits")
+        assertEquals("ref-prior", store.externalRef(task, "fake", "sam@x", NotificationKind.APPROVER), "the original handle is kept for later edits")
     }
 
     @Test
@@ -210,7 +338,6 @@ class NotificationServiceDbTest {
             queryResultStore = resultStore,
             webBaseUrl = "https://console.example",
             disclosure = StatementDisclosure.FULL,
-            statementMaxChars = 10_000,
             defaultLocale = "en",
         )
         // The terminal event goes to the requester AND a mere co-approver who neither requested nor ran it.

@@ -47,10 +47,10 @@ enum class AuthzAction(val cedarId: String) {
     // (stmt.kind.<k>, from the statement_exec grant) and the Cedar schema alone maps a kind to its category.
     // The control-plane never names a category — only the schema and operator policies do.
     // Datasource-level exception gates (facts-emission.md). A statement the analyzer cannot
-    // fully reason about (`analyzable=false`) or whose result cannot be masked on the chosen path
-    // (`maskable=false`, e.g. EXPLAIN-of-masked) asks its datasource for this exception instead of a blanket
-    // hardcoded DENY. Deny-by-default: no exception policy → DENY (the production floor is unchanged); a
-    // permissive dev datasource can permit the relay.
+    // fully reason about (`analyzable=false`) or whose masked result cannot be masked on the chosen wire path
+    // (`maskable=false`, e.g. the MySQL binary protocol) asks its datasource for this exception instead of a
+    // blanket hardcoded DENY. Deny-by-default: no exception policy → DENY (the production floor is unchanged);
+    // a permissive dev datasource can permit the relay.
     EXCEPTION_UNANALYZABLE("exception.unanalyzable"),
     EXCEPTION_UNMASKABLE("exception.unmaskable"),
 }
@@ -161,6 +161,9 @@ data class AuthzContext(
     val channel: String? = null,
     val requesterIp: String? = null,
     val tags: Set<String> = emptySet(),
+    // The statement's classified kind leaf (`select`, `explain`, `insert`, …). Lets a read policy condition
+    // on HOW a column is read — e.g. `result.read.unmasked` only under a plan-only EXPLAIN. Server-attested.
+    val stmtKind: String? = null,
 ) {
     /**
      * The Cedar `context` map. `network_zones` is always present (empty set if none); `tags` too UNLESS
@@ -173,6 +176,7 @@ data class AuthzContext(
         put("network_zones", CedarList(networkZones.map { PrimString(it) as Value }))
         if (includeTags) put("tags", CedarList(tags.map { PrimString(it) as Value }))
         channel?.let { put("channel", PrimString(it)) }
+        stmtKind?.let { put("stmt_kind", PrimString(it)) }
         requesterIp?.let { ip ->
             // Defensive: a malformed IP must NEVER break the whole decision. Fail-closed means the attribute
             // is simply absent (a policy conditioning on it then denies), not a thrown IpAddress constructor
@@ -828,11 +832,8 @@ internal fun Authz.authorizeWithContext(
 }
 
 /**
- * Gate an admin/privileged route: `true` if [Config.authDebug] (the dev-only bypass — mirrors
- * `requireApi`'s posture, the trusted-network dev story; this is NOT a Cedar bypass, Cedar
- * itself is never skipped, only never *reached* here), else 401 with no session, else the real
- * [Authz.authorize] decision (403 + the deny reason on Deny). This is what closes the "admin routes
- * require admin.*, not any session" hole once `config.authDebug=false` in production.
+ * Gate an admin/privileged route: 401 with no session, else the real [Authz.authorize] decision (403 +
+ * the deny reason on Deny). This is what closes the "admin routes require admin.*, not any session" hole.
  *
  * The ONE choke point every admin route funnels through — threading
  * [com.ridi.oss.proxymonster.controlplane.httpAuthzContext] here fixes `requester_ip` for every admin
@@ -849,11 +850,14 @@ suspend fun ApplicationCall.requireAdmin(
 
 /**
  * The general per-(action, resource) route gate — [requireAdmin]'s body, named for the routes that
- * aren't admin surfaces (token.* / workflow.* self-service and grant routes). Same posture:
- * [Config.authDebug] dev bypass → true; no session → 401; else the real
- * [Authz.authorize] decision (403 + reason on Deny). [requireAdmin] is the `System`-resource alias.
+ * aren't admin surfaces (token.* / workflow.* self-service and grant routes). No session → 401; else the
+ * real [Authz.authorize] decision (403 + reason on Deny). [requireAdmin] is the `System`-resource alias.
  * Build the [resource] (e.g. `Token(owner)`) from [userSession]'s principal at the call site, since it
- * usually references the caller — under `authDebug` this short-circuits before the session is read.
+ * usually references the caller.
+ *
+ * A dev session decides here like an SSO one: `PM_AUTH_DEBUG` adds the `/auth/debug` login (email plus the
+ * roles you ask for, minted as real assignments), so signing in with a LOW-privilege role holds you to it —
+ * which is how you test one.
  */
 suspend fun ApplicationCall.requireAuthz(
     config: Config,
@@ -861,13 +865,11 @@ suspend fun ApplicationCall.requireAuthz(
     action: AuthzAction,
     resource: AuthzResource,
 ): Boolean {
-    if (config.authDebug) return true
-    val session = userSession()
-    if (session == null) {
+    val principal = userSession()?.principal ?: run {
         respond(HttpStatusCode.Unauthorized, ApiError("common.unauthenticated"))
         return false
     }
-    return when (val decision = authz.authorize(session.principal, action, resource, httpAuthzContext(config))) {
+    return when (val decision = authz.authorize(principal, action, resource, httpAuthzContext(config))) {
         AuthzDecision.Allow -> true
         is AuthzDecision.Deny -> {
             respond(HttpStatusCode.Forbidden, ApiError("common.forbidden", mapOf("detail" to decision.reason)))

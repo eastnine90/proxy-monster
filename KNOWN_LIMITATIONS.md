@@ -162,21 +162,16 @@ analog of MySQL's Prepare-time freeze. No control-plane decision is ever stored.
   against real PostgreSQL). It is `GUC_REPORT`, so a session turning it off is
   observed and the relay fails closed (SQLSTATE `0A000`) rather than proxying
   under a divergent lexer.
-- 🔴 `search_path` mutated _inside_ Bind parameter coercion is untracked
-  (extended path). The bind-time capture probes the namespace immediately before
-  forwarding `Bind`, but `Bind` itself runs parameter input/coercion (input
-  functions, domain `CHECK`s) _before_ it plans the portal. A crafted domain
-  whose check calls `set_config('search_path', <bound value>, false)` moves the
-  path during `Bind`, so the portal resolves under a path the pre-`Bind` probe
-  never saw, and the `Execute` re-decide authorizes under the stale snapshot (a
-  wrong-ALLOW). Reproduced against PG16 by
-  `pgproxy.TestExtendedBindCoercionSetConfigLeaksAcrossSchema` (the proxy
-  decides under the primary path yet the target DB returns the secondary
-  schema's row). The offending domain must already exist, which needs a
-  `CREATE DOMAIN`/`CREATE FUNCTION` grant the masking policy denies read-only
-  principals. A fail-safe close (re-probe _after_ Bind, or bind under a pinned
-  `search_path`) is a follow-up. Tracked:
-  [`docs/backlog.md`](./docs/backlog.md).
+- 🟡 A `search_path` change made _inside_ Bind parameter coercion is not tracked
+  (extended path). `Bind` runs parameter input/coercion — input functions and
+  domain `CHECK`s — before it plans the portal, so a domain whose check calls
+  `set_config('search_path', <bound value>, false)` moves the path during
+  `Bind`, and the portal resolves under a path the pre-`Bind` namespace probe
+  never saw. Only user-defined code can change `search_path` mid-coercion, so
+  this is the same accepted case as a data-reading UDF: a domain or function
+  with a side effect is user code the operator vouches for, not a boundary the
+  proxy enforces. Reproduced against PG16 by
+  `pgproxy.TestExtendedBindCoercionSetConfigLeaksAcrossSchema`.
 
 ## Catalog freshness
 
@@ -265,11 +260,6 @@ tagging, table detail) and never feeds an enforcement decision.
   match `RENAME USER`, which is privilege management rather than schema DDL, so
   the over-deny is deliberate. The structured equivalent is permitted:
   `ALTER TABLE a RENAME TO b`.
-- 🟡 `EXPLAIN` of a query that requires masking is deliberately denied. The
-  analyzer emits the wrapped query's grants with `explain_of_query=true`, so an
-  unmasked inner query may proceed after its ordinary grants pass. If the
-  resulting verdict would be MASK, `decideQuery` denies with
-  `EXPLAIN_MASK_DENY`; this also covers `EXPLAIN ANALYZE`.
 - 🟢 Zero-column table scans require a table grant. A query that names no column
   of a table — `SELECT count(*) FROM t`, `SELECT 1 FROM t`,
   `EXISTS(SELECT 1 FROM t)`, a cross-join side that only multiplies cardinality
@@ -281,14 +271,17 @@ tagging, table detail) and never feeds an enforcement decision.
   already exposed through that column, so it needs no separate table grant; only
   a table with zero traced columns and no table grant is denied. Verified on
   PostgreSQL (`KnownGapsTest`) and MySQL (`ScannedTableMySqlTest`).
-- 🔴 Utility-command passthrough is still an existence oracle. Analyzer-path
-  (`ANALYZED`-class) zero-column scans are covered above, but utility commands
-  that classify as passthrough and take a table target — e.g. `ANALYZE <table>`
-  (PostgreSQL, `SESSION` → wire/editor passthrough, gated only by
-  `datasource.connect`, not a table grant) — still disclose an ungranted table's
-  existence via a target-DB error. They return no rows. The fix routes each
-  resource-bearing utility to a Cedar gate instead of the blanket passthrough
-  ([`docs/facts-emission.md`](./docs/facts-emission.md)).
+- 🟡 Whole-database `ANALYZE` forms are gated by statement kind, not per-table
+  reads. A table-targeted `ANALYZE TABLE t` (MySQL) / `ANALYZE t` (PostgreSQL)
+  carries its target's result-read grant, so a principal who cannot read the
+  table cannot ANALYZE it. The forms that name no single table — bare PostgreSQL
+  `ANALYZE` (every accessible table), `ANALYZE INDEX`/`DATABASE`/`CLUSTER` —
+  carry only the `analyze_table` statement kind, so `stmt.cat.admin.maintenance`
+  gates them but no per-table read does. They name no table to probe, so they
+  are not a single-table existence oracle; a maintenance-privileged principal
+  running one can still surface an unreadable table's name through a forwarded
+  target-DB notice (the shared target-DB account, tracked in
+  [`docs/backlog.md`](./docs/backlog.md)).
 
 ## Authz / policy
 
@@ -309,11 +302,6 @@ tagging, table detail) and never feeds an enforcement decision.
   effect. The benign session statements the forbid does deny (`SET NAMES`,
   `BEGIN`, `SET @var`) are otherwise ungated, which is why they are the ones
   that need the channel rule.
-- 🔴 Role-approval `Request` EUID is not request-unique.
-  `Request::"<requester>#<datasource>"` omits the request id and requested role,
-  so one approval policy authorizes every later request that principal makes for
-  that datasource — a wrong-ALLOW. Tracked in
-  [`docs/backlog.md`](./docs/backlog.md).
 - 🔴 `system:admin` immutability assumes single-instance, migrate-before-serve.
   The `system:admin` group is immutable through the API and SCIM via runtime
   guards inside `UserGroupStore`, which are in-process: they serialize
@@ -459,15 +447,15 @@ PostgreSQL client verifies with the downloaded file instead.
 - 🔴 The advertised chain's root of trust is the `Register` credential, not a
   proxy identity. One system-wide shared secret (`PM_SECRET_TOKEN`)
   authenticates every proxy RPC and `Register` accepts a caller-asserted
-  datasource name, so whoever holds that secret — or anyone who can reach the
-  gRPC port while it is unset, which starts the gate open — can re-register any
-  datasource's advertised address and chain, serve a matching cert, and capture
-  that datasource's wire tokens. The fix is a datasource-bound registrar
-  identity (a per-datasource register credential, proxy mTLS bound to the
-  permitted name, or an admin-owned trust record), not a change to how the chain
-  is verified. Set `PM_SECRET_TOKEN` on the control plane and every proxy:
-  startup does not require it today, and [`docs/backlog.md`](./docs/backlog.md)
-  tracks failing startup when it is unset in production. Trust boundary:
+  datasource name, so whoever holds that secret can re-register any datasource's
+  advertised address and chain, serve a matching cert, and capture that
+  datasource's wire tokens. The fix is a datasource-bound registrar identity (a
+  per-datasource register credential, proxy mTLS bound to the permitted name, or
+  an admin-owned trust record), not a change to how the chain is verified.
+  Production startup requires `PM_SECRET_TOKEN` (it is rejected when
+  `PM_AUTH_DEBUG` is false), so the gate can no longer be left open by omission;
+  the admin-equivalent scope of that one shared secret is the remaining gap.
+  Trust boundary:
   [`docs/datasource-registration.md`](./docs/datasource-registration.md).
 - 🟡 Every certificate in the advertised file becomes a trust anchor for `pmon`,
   including the leaf: it loads the whole PEM into a Go root pool, and Go trusts
@@ -510,18 +498,18 @@ connection so `SET`/`USE`/temp/`BEGIN` persist across queries. The one-shot
 path and `POST /api/datasources/{id}/query`, not the interactive editor.
 
 - 🟡 Editor statements decide as `Channel.EDITOR`, so `SESSION` statements
-  passthrough-ALLOW. Benign `SET`, `BEGIN`, `USE`, and `ANALYZE` are allowed on
-  the editor channel; classified privileged `SET` forms still pass their Utility
-  gate, and session statements stay denied on the workflow executor/viewer
-  channels. Because a persistent session holds ONE target-DB connection across
-  MANY statements, a session mutation can affect a later query on the same
-  connection; its safety rests on per-statement re-decide — every statement
-  round-trips to the proxy's `Decide` against that connection's live
-  per-connection catalog, so a mutated namespace is re-authorized rather than
-  carried silently, and a multi-statement `SET; SELECT` batch is rejected at
-  admission so passthrough only ever sees a pure session statement. Hard gate:
-  per-statement re-decide (or an explicit session-mutation refusal) must remain
-  the standing mitigation.
+  passthrough-ALLOW. Benign `SET`, `BEGIN`, and `USE` are allowed on the editor
+  channel; classified privileged `SET` forms still pass their Utility gate,
+  `ANALYZE` is gated by its statement kind and its target's read, and session
+  statements stay denied on the workflow executor/viewer channels. Because a
+  persistent session holds ONE target-DB connection across MANY statements, a
+  session mutation can affect a later query on the same connection; its safety
+  rests on per-statement re-decide — every statement round-trips to the proxy's
+  `Decide` against that connection's live per-connection catalog, so a mutated
+  namespace is re-authorized rather than carried silently, and a multi-statement
+  `SET; SELECT` batch is rejected at admission so passthrough only ever sees a
+  pure session statement. Hard gate: per-statement re-decide (or an explicit
+  session-mutation refusal) must remain the standing mitigation.
 - 🟡 Catalog adoption assumes one target DB behind a datasource. On MySQL a new
   connection may start from catalog content the control plane already holds
   rather than measuring the target DB itself, so its first statement decides

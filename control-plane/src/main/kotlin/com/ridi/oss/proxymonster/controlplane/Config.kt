@@ -100,8 +100,7 @@ data class Config(
     // posture as an unset PM_SCIM_TOKEN disabling SCIM, never a degraded half-configured mode.
     val slackBotToken: String? = null,
     val slackAppToken: String? = null,
-    val notifyStatement: String = "truncated",
-    val notifyStatementMax: Int = 200,
+    val notifyStatement: String = "auto",
     // Fallback language for a recipient who has never set one (app_user.locale).
     val notifyLocale: String = "en",
 ) {
@@ -216,6 +215,10 @@ data class Config(
                 "PM_SESSION_SECRET must be a non-default secret of at least 32 characters when PM_AUTH_DEBUG is false"
             }
             require(authDebug || oidc != null) { "PM_OIDC_* must be configured when PM_AUTH_DEBUG is false" }
+            val secretToken = env("PM_SECRET_TOKEN")
+            require(authDebug || !secretToken.isNullOrBlank()) {
+                "PM_SECRET_TOKEN must be configured when PM_AUTH_DEBUG is false"
+            }
             if (!authDebug) {
                 requireSecureOidcUri(requireNotNull(oidc).issuer, "PM_OIDC_ISSUER")
                 require(oidc.redirectUri == "$mcpIssuer/auth/oidc/callback") {
@@ -224,15 +227,21 @@ data class Config(
             }
 
             // A set-but-garbage value fails fast rather than silently falling back: a misconfigured
-            // disclosure mode would decide how much query text leaves the building.
-            val notifyStatement = (env("PM_NOTIFY_STATEMENT") ?: "truncated").trim().lowercase()
-            require(notifyStatement in setOf("truncated", "full", "omit")) {
-                "PM_NOTIFY_STATEMENT must be one of truncated|full|omit; got '$notifyStatement'"
+            // disclosure mode decides how much query text leaves the building. The removed `truncated` mode
+            // (a first-N-chars cut is no PII guarantee) coerces to `auto` — the hint-gated show it always was
+            // beneath the truncation — with a warning, so an existing config is not broken by the rename.
+            val notifyStatement = (env("PM_NOTIFY_STATEMENT") ?: "auto").trim().lowercase().let {
+                if (it == "truncated") {
+                    org.slf4j.LoggerFactory.getLogger(Config::class.java)
+                        .warn("PM_NOTIFY_STATEMENT=truncated is removed; using auto (hint-gated disclosure)")
+                    "auto"
+                } else {
+                    it
+                }
             }
-            val notifyStatementMax = env("PM_NOTIFY_STATEMENT_MAX")?.let {
-                it.toIntOrNull() ?: throw IllegalArgumentException("PM_NOTIFY_STATEMENT_MAX must be a positive integer; got '$it'")
-            } ?: 200
-            require(notifyStatementMax > 0) { "PM_NOTIFY_STATEMENT_MAX must be greater than zero" }
+            require(notifyStatement in setOf("omit", "auto", "full")) {
+                "PM_NOTIFY_STATEMENT must be one of omit|auto|full; got '$notifyStatement'"
+            }
             val notifyLocale = (env("PM_NOTIFY_LOCALE") ?: "en").trim().lowercase()
             require(notifyLocale in setOf("en", "ko")) { "PM_NOTIFY_LOCALE must be one of en|ko; got '$notifyLocale'" }
 
@@ -243,7 +252,7 @@ data class Config(
                 dbUser = env("PM_DB_USER") ?: "proxymonster",
                 dbPassword = env("PM_DB_PASSWORD") ?: "proxymonster",
                 authDebug = authDebug,
-                secretToken = env("PM_SECRET_TOKEN"),
+                secretToken = secretToken,
                 sessionSecret = sessionSecret,
                 oidc = oidc,
                 resultKey = env("PM_RESULT_KEY")?.let { b64 ->
@@ -278,7 +287,6 @@ data class Config(
                 slackBotToken = env("PM_SLACK_BOT_TOKEN")?.takeIf { it.isNotBlank() },
                 slackAppToken = env("PM_SLACK_APP_TOKEN")?.takeIf { it.isNotBlank() },
                 notifyStatement = notifyStatement,
-                notifyStatementMax = notifyStatementMax,
                 notifyLocale = notifyLocale,
             )
         }

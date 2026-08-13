@@ -4,7 +4,6 @@ import com.ridi.oss.proxymonster.controlplane.authz.Authz
 import com.ridi.oss.proxymonster.controlplane.authz.AuthzAction
 import com.ridi.oss.proxymonster.controlplane.authz.AuthzContext
 import com.ridi.oss.proxymonster.controlplane.authz.AuthzDecision
-import com.ridi.oss.proxymonster.controlplane.authz.AuthzResource
 import com.ridi.oss.proxymonster.controlplane.authz.ColumnRef
 import com.ridi.oss.proxymonster.controlplane.authz.ColumnVerdict
 import com.ridi.oss.proxymonster.controlplane.authz.FunctionRef
@@ -355,8 +354,9 @@ internal fun effectiveAuthzContext(
     roles: Set<String>,
     datasource: String,
     datasourceTags: List<String>,
+    stmtKind: String? = null,
 ): AuthzContext {
-    val raw = caller.copy(channel = channel.contextValue)
+    val raw = caller.copy(channel = channel.contextValue, stmtKind = stmtKind)
     return raw.copy(tags = authz.resolveContextTags(principal, roles, datasource, raw, datasourceTags))
 }
 
@@ -443,8 +443,24 @@ fun decideQuery(
     // own roles). Ordinary resolution is already deleted-role-filtered in RoleResolver.
     val roles = providedRoles?.let { policyStore.liveRoleNames(it) } ?: roleResolver.resolve(principal)
     val roleList = roles.toList()
+    // The statement's classified kind, resolved before the context so a read policy can condition on it
+    // (`context.stmt_kind`) — e.g. permit unmasked reads only under a plan-only EXPLAIN, which returns no
+    // rows. STMT_UNKNOWN (a pre-parse failure), like an unspecified/unrecognized kind, leaves stmt_kind
+    // ABSENT rather than exposing a value to condition on; it routes through exception.unanalyzable at the
+    // kind gate below.
+    val statementKind = if (facts.hasStatementExec()) facts.statementExec.statementKind
+    else StatementKind.STATEMENT_KIND_STMT_UNKNOWN
     @Suppress("NAME_SHADOWING")
-    val context = effectiveAuthzContext(context, channel, authz, principal, roles, ds.name, ds.tags)
+    val context = effectiveAuthzContext(
+        context, channel, authz, principal, roles, ds.name, ds.tags,
+        stmtKind = statementKind
+            .takeIf {
+                it != StatementKind.STATEMENT_KIND_UNSPECIFIED &&
+                    it != StatementKind.STATEMENT_KIND_STMT_UNKNOWN &&
+                    it != StatementKind.UNRECOGNIZED
+            }
+            ?.name?.removePrefix("STATEMENT_KIND_")?.lowercase(),
+    )
     val derivedTags = context.tags.toList()
 
     // Fail-closed contract validation (analyzer.proto): the single statement-execution grant is the sole
@@ -534,8 +550,6 @@ fun decideQuery(
     // connect-only gaps (ANALYZE TABLE, SHOW MASTER STATUS, …). A missing grant (a pre-parse failure) reads
     // as STMT_UNKNOWN → exception.unanalyzable. Runs after connect/utility, before the passthrough allow; the
     // unanalyzable/utility gates still apply on top (e.g. ALTER TABLE stays prod-denied).
-    val statementKind = if (facts.hasStatementExec()) facts.statementExec.statementKind
-    else StatementKind.STATEMENT_KIND_STMT_UNKNOWN
     val kindAction = statementKindActionId(statementKind)
         ?: return structuralDeny("statement kind is unspecified", roleList, contextTags = derivedTags)
     if (authz.authorizeDatasourceActionId(principal, roles, kindAction, ds.name, context, ds.tags) !is AuthzDecision.Allow) {
@@ -754,9 +768,6 @@ fun decideQuery(
     }
 
     val action = if (masks.isEmpty()) EnfAction.ALLOW else EnfAction.MASK
-    if (facts.explainOfQuery && action == EnfAction.MASK) {
-        return structuralDeny(EXPLAIN_MASK_DENY, roleList, failedStage = "explain-masked", contextTags = derivedTags)
-    }
     // Every classified column the statement touched, whatever its tags are named: `pii` is a deployment's
     // own tag, so keying this on that one string leaves auditmon's mass-export detector blind on a
     // deployment that classifies with `pci`.
@@ -804,8 +815,6 @@ private val MALFORMED_DISPOSITIONS = setOf(
 )
 
 internal const val MASK_BIND_DENY = "required mask could not be bound to a result column"
-private const val EXPLAIN_MASK_DENY =
-    "cannot EXPLAIN a query whose columns are masked — request full access or run the query directly"
 private const val SYSTEM_FUNCTION_DENY = "dangerous system function is not allowed:"
 private const val SYSTEM_UTILITY_DENY = "utility command is not allowed on this datasource:"
 private const val DEACTIVATED_PRINCIPAL_DENY = "principal is deprovisioned (deactivated) — access denied"
@@ -871,11 +880,11 @@ internal fun wireTaskForbiddenDeny(
 // Relay the analyzer's optional rewritten SQL on a decision we allow. rewrittenSql is Go-analyzer output
 // (the `SELECT *` expansion, the MySQL charset pin) independent of statement class, so every
 // understood-and-allowed decision — analyzed, metadata, session — routes it through this one point rather
-// than each building its own. An EXPLAIN-of-query keeps its original text (the rewrite is for the inner query
-// it plans). The exception.unanalyzable escape hatches deliberately relay the original whole statement, so they do
-// not call this.
+// than each building its own. An EXPLAIN/DESCRIBE keeps its original text — the analyzer emits no
+// rewritten_sql for it (the rewrite is for the inner query it plans). The exception.unanalyzable escape
+// hatches deliberately relay the original whole statement, so they do not call this.
 private fun DecisionContext.withAnalyzerRewrite(facts: StatementFacts): DecisionContext =
-    if (facts.hasRewrittenSql() && !facts.explainOfQuery) copy(rewrittenSql = facts.rewrittenSql) else this
+    if (facts.hasRewrittenSql()) copy(rewrittenSql = facts.rewrittenSql) else this
 
 // The Cedar action a statement's kind is gated by. "stmt.kind.<k>" is a member of its category action in
 // the schema, so a category or kind preset matches it; an admin-category kind with no preset denies —
@@ -942,11 +951,10 @@ fun Route.queryRoutes(
     runExecService: RunExecService,
 ) {
     post("/api/datasources/{id}/query") {
-        if (!call.requireApi(config)) return@post
+        val principal = call.requireApi() ?: return@post
         val id = call.idParam() ?: return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
         val ds = datasourceStore.get(id) ?: return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "datasource")))
         val req = call.receive<QueryRequest>()
-        val principal = call.userSession()?.principal ?: "debug-user"
         // Auto-save the run to the principal's editor history (best-effort; never blocks the query).
         runCatching { historyStore.add(principal, id, req.sql) }
         try {
@@ -1011,11 +1019,10 @@ fun Route.editorSessionRoutes(
     taskCompletionHub: TaskCompletionHub? = null,
 ) {
     post("/api/editor/sessions") {
-        if (!call.requireApi(config)) return@post
+        val principal = call.requireApi() ?: return@post
         val input = call.receive<OpenEditorSessionInput>()
         val ds = datasourceStore.get(input.datasourceId)
             ?: return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "datasource")))
-        val principal = call.userSession()?.principal ?: "debug-user"
         try {
             call.respond(EditorSessionOpened(runExecService.openSession(principal, ds, call.httpRequesterIp(config))))
         } catch (_: NoProxyAttachedException) {
@@ -1032,10 +1039,9 @@ fun Route.editorSessionRoutes(
     // Async submit: launch the run as an auto-approved EDITOR task on the held session and ACK 202 — no rows
     // inline (mirrors /api/approvals/{id}/execute). The web swaps its tab's taskId and polls to completion.
     post("/api/editor/sessions/{sessionId}/query") {
-        if (!call.requireApi(config)) return@post
+        val principal = call.requireApi() ?: return@post
         val sessionId = call.parameters["sessionId"]
             ?: return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val req = call.receive<QueryRequest>()
         val sql = req.sql
         if (sql.isBlank()) {
@@ -1055,11 +1061,8 @@ fun Route.editorSessionRoutes(
             ?: return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "datasource")))
         val store = queryResultStore
             ?: return@post call.respond(HttpStatusCode.ServiceUnavailable, ApiError("approval.result_storage_not_configured"))
-        // Self-approve on the editor channel: must clear task.request AND task.approve. authDebug bypasses.
-        if (!config.authDebug && !autoApproveTask(
-                principal, ownRoles, ds, call.httpAuthzContext(config), authz, Channel.EDITOR,
-            )
-        ) {
+        // Self-approve on the editor channel: must clear task.request AND task.approve.
+        if (!autoApproveTask(principal, ownRoles, ds, call.httpAuthzContext(config), authz, Channel.EDITOR)) {
             return@post call.respond(HttpStatusCode.Forbidden, ApiError("common.forbidden"))
         }
 
@@ -1141,56 +1144,44 @@ fun Route.editorSessionRoutes(
     // Poll: task status + child metadata. Owner-scoped to the caller's own EDITOR tasks (task.read/own);
     // 404 for a non-owner / non-EDITOR id, so it's not an existence oracle. Rows stay behind /result.
     get("/api/editor/tasks/{taskId}") {
-        if (!call.requireApi(config)) return@get
+        val principal = call.requireApi() ?: return@get
         val taskId = call.parameters["taskId"]?.toLongOrNull()
             ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val task = accessStore.getRequest(taskId)
         if (task == null || task.kind != "QUERY" || task.creatorKind != "EDITOR" || task.principal != principal) {
             return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "editor task")))
         }
         // task.read gates the metadata (status, row count, column names, error code, timestamps) — the owner
         // guard above is not a substitute: a Cedar forbid (e.g. task.read denied from an untrusted zone) must
-        // still override the self-read permit. authDebug bypasses, matching every other route's Cedar gate.
-        if (!config.authDebug) {
-            val mayRead = authz.authorizeWithContext(
-                principal, AuthzAction.TASK_READ,
-                AuthzResource.ApprovalRequest(
-                    requester = task.principal, approver = task.decidedBy, executedBy = task.executedBy,
-                    datasourceName = task.datasourceName, roleName = task.roleName,
-                ),
-                call.httpAuthzContext(config), task.datasourceName,
-                task.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
-            )
-            if (mayRead is AuthzDecision.Deny) {
-                return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "editor task")))
-            }
+        // still override the self-read permit.
+        val mayRead = authz.authorizeWithContext(
+            principal, AuthzAction.TASK_READ,
+            task.toApprovalResource(),
+            call.httpAuthzContext(config), task.datasourceName,
+            task.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
+        )
+        if (mayRead is AuthzDecision.Deny) {
+            return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "editor task")))
         }
         call.respond(EditorTaskStatus(task.id, task.status, queryResultStore?.meta(taskId)))
     }
 
     post("/api/editor/tasks/{taskId}/cancel") {
-        if (!call.requireApi(config)) return@post
+        val principal = call.requireApi() ?: return@post
         val taskId = call.parameters["taskId"]?.toLongOrNull()
             ?: return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val task = accessStore.getRequest(taskId)
         if (task == null || task.kind != "QUERY" || task.creatorKind != "EDITOR" || task.principal != principal) {
             return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "editor task")))
         }
-        if (!config.authDebug) {
-            val mayCancel = authz.authorizeWithContext(
-                principal, AuthzAction.TASK_CANCEL,
-                AuthzResource.ApprovalRequest(
-                    requester = task.principal, approver = task.decidedBy, executedBy = task.executedBy,
-                    datasourceName = task.datasourceName, roleName = task.roleName,
-                ),
-                call.httpAuthzContext(config), task.datasourceName,
-                task.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
-            )
-            if (mayCancel is AuthzDecision.Deny) {
-                return@post call.respond(HttpStatusCode.Forbidden, ApiError("approval.cancel_forbidden"))
-            }
+        val mayCancel = authz.authorizeWithContext(
+            principal, AuthzAction.TASK_CANCEL,
+            task.toApprovalResource(),
+            call.httpAuthzContext(config), task.datasourceName,
+            task.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
+        )
+        if (mayCancel is AuthzDecision.Deny) {
+            return@post call.respond(HttpStatusCode.Forbidden, ApiError("approval.cancel_forbidden"))
         }
         if (task.status != "EXECUTING") {
             return@post call.respond(EditorTaskStatus(task.id, task.status, queryResultStore?.meta(taskId)))
@@ -1216,10 +1207,9 @@ fun Route.editorSessionRoutes(
     // Rows: task.assume gates the viewer (no authDebug bypass — data confidentiality), then the stored result
     // is re-decided live under the task's execute-as roles on the EDITOR channel — mirrors the approval view.
     get("/api/editor/tasks/{taskId}/result") {
-        if (!call.requireApi(config)) return@get
+        val principal = call.requireApi() ?: return@get
         val taskId = call.parameters["taskId"]?.toLongOrNull()
             ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val task = accessStore.getRequest(taskId)
         // Owner-scoped (frozen contract): an editor result is readable ONLY by its own submitter. The
         // task.assume check below is defense-in-depth (the owner passes it via the task.assume-parties policy);
@@ -1238,10 +1228,7 @@ fun Route.editorSessionRoutes(
             ?: return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "editor task")))
         val mayAssume = authz.authorizeWithContext(
             principal, AuthzAction.TASK_ASSUME,
-            AuthzResource.ApprovalRequest(
-                requester = task.principal, approver = task.decidedBy, executedBy = task.executedBy,
-                datasourceName = task.datasourceName, roleName = task.roleName,
-            ),
+            task.toApprovalResource(),
             call.httpAuthzContext(config), task.datasourceName,
             task.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
         )
@@ -1296,10 +1283,9 @@ fun Route.editorSessionRoutes(
     // Delete-on-close: drop the tab's saved rows + its task row (CASCADE). Owner-scoped + EDITOR-only, so a
     // leaked id can't delete another principal's task; a non-owner / unknown id is a silent, idempotent 204.
     delete("/api/editor/tasks/{taskId}") {
-        if (!call.requireApi(config)) return@delete
+        val principal = call.requireApi() ?: return@delete
         val taskId = call.parameters["taskId"]?.toLongOrNull()
             ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val task = accessStore.getRequest(taskId)
         if (task != null && task.kind == "QUERY" && task.creatorKind == "EDITOR" && task.principal == principal) {
             if (task.status == "EXECUTING") runExecService.cancelActiveRun(taskId)
@@ -1310,13 +1296,12 @@ fun Route.editorSessionRoutes(
     }
 
     delete("/api/editor/sessions/{sessionId}") {
-        if (!call.requireApi(config)) return@delete
+        val principal = call.requireApi() ?: return@delete
         val sessionId = call.parameters["sessionId"]
             ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
         // Close only if the caller owns the session (mirrors runOnSession) — a leaked sessionId must not let
         // another principal tear down this connection. Idempotent NoContent regardless, so it's not an
         // existence oracle for someone else's session id.
-        val principal = call.userSession()?.principal ?: "debug-user"
         runExecService.closeSessionOwnedBy(sessionId, principal)
         call.respond(HttpStatusCode.NoContent)
     }
