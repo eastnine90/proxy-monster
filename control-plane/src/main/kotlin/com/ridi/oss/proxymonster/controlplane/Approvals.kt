@@ -938,7 +938,7 @@ internal suspend fun runApprovedTask(
         if (response.decision == EnfAction.DENY) {
             "approval.execute_denied"
         } else {
-            val result = DecryptedResult(response.columns, response.rows)
+            val result = DecryptedResult(response.columns, response.rows, response.rowsAffected)
             // Child DONE, parent EXECUTED, and the execution audit all commit in ONE transaction: a crash can
             // never leave a readable DONE child under a non-EXECUTED task. If the parent has left EXECUTING
             // (e.g. a restart already reconciled it to FAILED), the flip fails and aborts the whole commit —
