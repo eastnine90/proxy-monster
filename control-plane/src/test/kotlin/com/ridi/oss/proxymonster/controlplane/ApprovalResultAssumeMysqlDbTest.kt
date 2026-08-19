@@ -21,10 +21,12 @@ class ApprovalResultAssumeMysqlDbTest {
     private lateinit var fx: EnforcementFixture
     private lateinit var datasource: Datasource
     private var roleId = 0L
+    private var viewerRoleId = 0L
 
     private val requester = "requester@example.com"
     private val approver = "approver@example.com"
     private val roleName = "system:production-pii-accessor"
+    private val viewerRoleName = "system:development-viewer"
     private val rawSsn = "987-65-4320"
     private val maskedSsn = "*******4320"
     private var explainPolicyEnabled = false
@@ -47,6 +49,7 @@ class ApprovalResultAssumeMysqlDbTest {
         listOf(-250L, -251L, -256L, -257L, -258L, -260L).forEach {
             checkNotNull(fx.cedarPolicyStore.setEnabled(it, true, "test-enable-production"))
         }
+        viewerRoleId = fx.policyStore.listRoles().first { it.name == viewerRoleName }.id
         fx.cedarPolicyStore.create(
             CedarPolicyInput(
                 name = "trusted-network-test",
@@ -73,7 +76,11 @@ class ApprovalResultAssumeMysqlDbTest {
         context = AuthzContext(requesterIp = ip),
     )
 
-    private fun request(sql: String = "SELECT ssn FROM users") = AccessRequest(
+    private fun request(
+        sql: String = "SELECT ssn FROM users",
+        roleName: String = this.roleName,
+        roleId: Long = this.roleId,
+    ) = AccessRequest(
         id = 1,
         principal = requester,
         roleId = roleId,
@@ -101,12 +108,14 @@ class ApprovalResultAssumeMysqlDbTest {
     private fun viewExplain(
         sql: String,
         decrypted: DecryptedResult,
+        roleName: String = this.roleName,
+        roleId: Long = this.roleId,
         requesterIp: String = "100.100.1.10",
     ): ResultViewDecision {
         ensureExplainPolicy()
         return decideResultView(
             viewer = requester,
-            req = request(sql),
+            req = request(sql, roleName, roleId),
             childSql = sql,
             ds = datasource,
             decrypted = decrypted,
@@ -320,10 +329,27 @@ class ApprovalResultAssumeMysqlDbTest {
     }
 
     @Test
+    fun `editor view denies a malformed-width explain plan`() {
+        val stored = fx.execOnTarget("EXPLAIN SELECT id FROM users")
+        check(stored.columns.size > 1)
+        val malformed = DecryptedResult(stored.columns.dropLast(1), stored.rows)
+
+        assertIs<ResultViewDecision.Denied>(
+            viewExplain("EXPLAIN SELECT id FROM users", malformed),
+        )
+    }
+
+    @Test
     fun `editor view denies an explain plan whose inner query would mask a protected column`() {
         val stored = fx.execOnTarget("EXPLAIN SELECT ssn FROM users")
         assertIs<ResultViewDecision.Denied>(
-            viewExplain("EXPLAIN SELECT ssn FROM users", DecryptedResult(stored.columns, stored.rows)),
+            viewExplain(
+                "EXPLAIN SELECT ssn FROM users",
+                DecryptedResult(stored.columns, stored.rows),
+                roleName = viewerRoleName,
+                roleId = viewerRoleId,
+                requesterIp = "100.99.1.10",
+            ),
         )
     }
 
@@ -338,7 +364,13 @@ class ApprovalResultAssumeMysqlDbTest {
 
         val deniedStored = fx.execOnTarget("EXPLAIN ANALYZE SELECT ssn FROM users")
         assertIs<ResultViewDecision.Denied>(
-            viewExplain("EXPLAIN ANALYZE SELECT ssn FROM users", DecryptedResult(deniedStored.columns, deniedStored.rows)),
+            viewExplain(
+                "EXPLAIN ANALYZE SELECT ssn FROM users",
+                DecryptedResult(deniedStored.columns, deniedStored.rows),
+                roleName = viewerRoleName,
+                roleId = viewerRoleId,
+                requesterIp = "100.99.1.10",
+            ),
         )
     }
 }
