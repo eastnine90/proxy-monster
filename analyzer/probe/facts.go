@@ -18,6 +18,7 @@ var safeNoFromFunctions = stringSet(
 	"version", "current_schema", "current_schemas", "current_database", "current_catalog",
 	"current_user", "session_user", "current_role", "user", "database", "schema", "connection_id",
 	"pg_backend_pid", "pg_is_in_recovery", "pg_postmaster_start_time", "current_setting",
+	"txid_current", "pg_current_xact_id",
 	"inet_server_addr", "inet_server_port", "inet_client_addr", "inet_client_port",
 	"last_insert_id", "row_count", "found_rows", "charset", "collation", "coercibility",
 	"now", "current_timestamp", "current_date", "current_time", "localtime", "localtimestamp",
@@ -37,6 +38,22 @@ var safeNoFromFunctions = stringSet(
 	"cast", "convert", "coalesce", "nullif", "ifnull", "isnull", "nvl", "greatest", "least",
 	"iif", "if", "typeof", "pg_typeof",
 )
+
+// postgresInformationSchemaFunctions are PostgreSQL's information_schema helper builtins — stable,
+// read-only transforms of their arguments (pgJDBC metadata queries call them). Safe ONLY under an
+// explicit `information_schema.` qualifier; the unqualified spelling stays gated so a same-named
+// user function cannot inherit the pass.
+var postgresInformationSchemaFunctions = stringSet(
+	"_pg_char_max_length", "_pg_char_octet_length", "_pg_datetime_precision", "_pg_expandarray",
+	"_pg_index_position", "_pg_interval_type", "_pg_numeric_precision", "_pg_numeric_precision_radix",
+	"_pg_numeric_scale", "_pg_truetypid", "_pg_truetypmod",
+)
+
+func isTrustedInformationSchemaCall(qualifier exp.Expression, leaf string, eng engine) bool {
+	return eng.Type() == pb.Engine_POSTGRES && qualifier != nil &&
+		qualifier.Kind() == exp.KindIdentifier && qualifier.Name() == "information_schema" &&
+		postgresInformationSchemaFunctions[leaf]
+}
 
 // mysqlOnlySafeFunctions are safe no-FROM function names that exist ONLY on MySQL. `values` is MySQL's
 // INSERT … ON DUPLICATE KEY UPDATE pseudo-function — it names the value that would have been inserted, not a
@@ -725,7 +742,24 @@ func noFromFunctionGrants(root exp.Expression, eng engine) []*pb.RequireResultRe
 			}
 			continue
 		}
+		if isTrustedInformationSchemaCall(dot.Left(), leaf, eng) {
+			continue
+		}
 		emit(qualifiedCallName(dot.Left(), leaf, eng))
+	}
+	// A FROM-form call carries its qualifier on the Table node, not a Dot wrapper.
+	for _, table := range root.FindAll(exp.KindTable) {
+		fn := table.This()
+		if fn == nil || !fn.Is(exp.TraitFunc) || table.Arg("catalog") != nil {
+			continue
+		}
+		schema, _ := table.Arg("schema").(exp.Expression)
+		if schema == nil {
+			continue
+		}
+		if isTrustedInformationSchemaCall(schema, strings.ToLower(fn.Name()), eng) {
+			qualified[fn] = true
+		}
 	}
 	for _, fn := range root.FindAll(exp.TraitFunc) {
 		if fn.Kind() != exp.KindAnonymous || qualified[fn] {
@@ -797,6 +831,9 @@ func hasUnsafeCall(root exp.Expression, eng engine) bool {
 			if !safeNoFromFunctions[strings.ToLower(fn.Name())] {
 				return true
 			}
+			continue
+		}
+		if isTrustedInformationSchemaCall(dot.Left(), normalizedFunctionName(fn, eng), eng) {
 			continue
 		}
 		return true
