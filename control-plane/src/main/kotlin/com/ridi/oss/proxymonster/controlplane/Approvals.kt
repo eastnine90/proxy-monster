@@ -12,6 +12,7 @@ import com.ridi.oss.proxymonster.controlplane.management.ManagementAuditRecorder
 import com.ridi.oss.proxymonster.controlplane.notify.NotificationEvent
 import com.ridi.oss.proxymonster.controlplane.notify.NotificationService
 import com.ridi.oss.proxymonster.grpc.EnfAction
+import com.ridi.oss.proxymonster.grpc.RunError
 import com.ridi.oss.proxymonster.probe.Masking
 import com.ridi.oss.proxymonster.probe.bindMasks
 import io.ktor.http.HttpStatusCode
@@ -59,68 +60,55 @@ private val AccessRequest.isWorkflowApproval: Boolean
     get() = kind == "QUERY" && creatorKind == "WORKFLOW"
 
 /**
- * A role the requester could ask to run Q under (approval-workflow.md, "role discovery").
+ * A role the statement can run under (approval-workflow.md, "role discovery").
  *
- * [decision] and [maskedColumns] are what Q returns under this role WHEN EXECUTED BY THE WORKFLOW — the
- * `workflow-executor` channel an approved query actually runs on, which is the only outcome the request
- * can deliver. A role is listed whenever that outcome is not a denial, rather than only when it beats the
- * requester's own roles: "runs, but still masked" is an answer they need in order to stop looking.
- *
- * [unmasksColumns] is the pre-existing summary: columns this role unmasks relative to the baseline.
+ * [decision] and [maskedColumns] are the outcome under this role on the `workflow-executor` channel — the
+ * channel an approved query runs on — PREVIEWED in the requester's current context. Execution runs in the
+ * approver's context and can narrow further (e.g. off a trusted network), so this is the previewed outcome,
+ * not a guaranteed one.
  */
 @Serializable
 data class RoleOption(
     val roleId: Long,
     val roleName: String,
-    val unmasksColumns: List<String>,
     val decision: Decision = Decision.ALLOW,
     val maskedColumns: List<String> = emptyList(),
 )
 
 @Serializable
-data class DiscoverRolesResponse(val baselineAllowed: Boolean, val options: List<RoleOption>)
+data class DiscoverRolesResponse(
+    val options: List<RoleOption>,
+)
 
 /**
- * APPROVAL role discovery (approval-workflow.md — "the requester picks R"): offer every role R the requester
- * does not already hold under which Q runs from SOME network posture, each with its per-posture outcome. R is
- * the elevation unit the request carries (`access_request.role_id`); the workflow adds lifecycle, not
- * authorization.
+ * APPROVAL role discovery (approval-workflow.md — "the requester picks R"): list every role the statement can
+ * run under — one entry per role that is not denied under that role alone. There is no baseline and no
+ * held-vs-not-held concept: a role is offered whether or not the requester already holds it, so a statement
+ * that already runs can still be taken through the workflow for approval/audit.
  *
- * PREVIEW PARITY: each candidate is previewed ALONE — `decide(setOf(role.name), …)`, never unioned with the
- * requester's own roles — because execute-under-R runs with `assumeRoles = setOf(R)` alone. A unioned preview
- * could ALLOW here and DENY at execute, offering a role the requester cannot actually run. Only the baseline
- * and the already-held filter are keyed on the requester's own roles.
- *
- * RESIDUAL GAP: the approver's own identity and address are not known at discovery time, so a policy
- * conditioned on them can still make an offered R deny at execute. The channel and network axes are modeled
- * (candidates preview on the execution channel, across both postures); the approver-identity axis is not.
+ * PREVIEW PARITY: each role is previewed ALONE — `decide(setOf(role.name), …)`, never unioned with the
+ * requester's own roles — because execute-under-R runs with `assumeRoles = setOf(R)` alone, on the
+ * `workflow-executor` channel an approved query actually runs on. A unioned or wrong-channel preview could
+ * ALLOW here and DENY at execute, offering a role the requester cannot actually run.
  *
  * [decide] runs the real decision path and MUST be side-effect-free — discovery is a dry run, no audit write.
  */
 fun discoverRoles(
-    ownRoles: Set<String>,
     allRoles: List<Role>,
     decide: (roles: Set<String>, channel: Channel) -> DecisionContext,
 ): DiscoverRolesResponse {
-    // The baseline answers "what do I get right now", so it decides where the requester is: the editor
-    // channel, under their own roles.
-    val baseline = decide(ownRoles, Channel.EDITOR)
-    val baselineMasked = baseline.masks.map { it.column }.toSet()
-    val baselineDenied = baseline.action == EnfAction.DENY
-
-    val options = allRoles.filterNot { it.name in ownRoles }.mapNotNull { role ->
+    val options = allRoles.mapNotNull { role ->
         val underR = decide(setOf(role.name), Channel.WORKFLOW_EXECUTOR)
         if (underR.action == EnfAction.DENY) return@mapNotNull null
         val masked = underR.masks.map { it.column }.distinct().sorted()
         RoleOption(
             roleId = role.id,
             roleName = role.name,
-            unmasksColumns = (baselineMasked - masked.toSet()).sorted(),
             decision = if (masked.isEmpty()) Decision.ALLOW else Decision.MASK,
             maskedColumns = masked,
         )
     }
-    return DiscoverRolesResponse(baselineAllowed = !baselineDenied, options = options)
+    return DiscoverRolesResponse(options = options)
 }
 
 @Serializable data class ApprovalDetail(
@@ -144,8 +132,11 @@ fun discoverRoles(
     val meta: QueryResultMeta,
     val columns: List<String>,
     val rows: List<List<String?>>,
-    val decision: Decision = Decision.ALLOW,
+    // The view re-decision's verdict; null on a FAILED view (no rows released to label).
+    val decision: Decision? = null,
     val maskedColumns: List<String> = emptyList(),
+    // A FAILED run's target-DB error — raw or redacted per this viewer (failedDiagnosticForViewer).
+    val errorDetail: String? = null,
 )
 
 /** Submit acknowledgement. Completion is observed by polling the task detail/result endpoints. */
@@ -184,21 +175,23 @@ internal sealed class ResultViewDecision {
 }
 
 /**
- * Re-evaluate a stored execute-under-R result for the actual viewer in their live HTTP context. The store
- * holds R's execution-enforced output; this function re-applies R's masks for the viewer's current context,
- * narrowing further where it requires. Every uncertainty is a deny: no role/SQL, policy DENY, passthrough,
- * output-column drift, or an unbound mask.
- *
- * [childSql] is the statement of the SAME result child whose bytes are in [decrypted] (from
- * [ResultAccess.sql]) — NOT the task's first-child `req.sql`, which can diverge once a task holds plural
- * children. Re-deciding the released child's own statement keeps the masking verdict bound to those bytes.
+ * Which form of a FAILED run's stored [diagnostic] this viewer may see: the raw message when their view
+ * decision relays raw, the redacted one when it sanitizes, neither on a deny or a missing re-decision.
  */
-internal fun decideResultView(
+internal fun failedDiagnosticForViewer(ctx: DecisionContext?, diagnostic: RunError?): String? = when {
+    ctx == null || diagnostic == null || ctx.action == EnfAction.DENY -> null
+    ctx.sanitizeDiagnostics -> diagnostic.message
+    else -> diagnostic.rawMessage
+}
+
+/**
+ * The GET /result view's re-decision: decide [childSql] as [viewer] under its live execute-as roles {R}.
+ * Null if the SQL, datasource, or roles are gone (a soft-deleted role grants nothing).
+ */
+internal fun viewerDecision(
     viewer: String,
     req: AccessRequest,
     childSql: String?,
-    ds: Datasource,
-    decrypted: DecryptedResult,
     callerContext: AuthzContext,
     datasourceStore: DatasourceStore,
     policyStore: PolicyStore,
@@ -207,33 +200,35 @@ internal fun decideResultView(
     roleResolver: RoleResolver,
     authz: Authz,
     systemClassification: SystemClassificationService?,
-    // The decide-channel the released bytes are re-masked under. WORKFLOW_VIEWER for an approval view; the
-    // editor result view passes EDITOR so its re-decision matches how runOnSession enforced the run (both on
-    // the editor channel, under the same own-roles set), rather than a workflow viewer's context.
-    channel: Channel = Channel.WORKFLOW_VIEWER,
-): ResultViewDecision {
-    val sql = childSql ?: return ResultViewDecision.Denied("saved result child has no SQL")
-    // Drop any execute-as role soft-deleted since the snapshot was frozen: it must grant nothing, so a
-    // stored result never re-decides under a role that no longer exists (an empty result denies below).
-    val roles = policyStore.liveRoleNames(req.executeAs)
-    if (roles.isEmpty()) return ResultViewDecision.Denied("approval request has no live execute-as roles")
-    val ctx = decideQuery(
-        principal = viewer,
-        ds = ds,
-        sql = sql,
-        channel = channel,
-        catalog = datasourceStore.catalog(ds.id),
-        policyStore = policyStore,
-        accessStore = accessStore,
-        userGroupStore = userGroupStore,
-        roleResolver = roleResolver,
-        authz = authz,
-        providedRoles = roles,
-        context = callerContext,
-        systemClassification = systemClassification,
+    channel: Channel,
+): DecisionContext? {
+    val sql = childSql ?: return null
+    val ds = req.datasourceId?.let(datasourceStore::get) ?: return null
+    val roles = policyStore.liveRoleNames(req.executeAs).ifEmpty { return null }
+    return decideQuery(
+        principal = viewer, ds = ds, sql = sql, channel = channel,
+        catalog = datasourceStore.catalog(ds.id), policyStore = policyStore, accessStore = accessStore,
+        userGroupStore = userGroupStore, roleResolver = roleResolver, authz = authz,
+        providedRoles = roles, context = callerContext, systemClassification = systemClassification,
     )
+}
+
+/**
+ * Re-apply R's masks to a stored result's [decrypted] bytes under the viewer's live [ctx]. Every
+ * uncertainty denies: policy DENY, passthrough mismatch, fingerprint drift, an unbound mask.
+ */
+internal fun decideResultView(ctx: DecisionContext, decrypted: DecryptedResult): ResultViewDecision {
     if (ctx.action == EnfAction.DENY) {
         return ResultViewDecision.Denied(ctx.denyReason ?: ctx.detail ?: "view decision denied")
+    }
+    // A stored result must never be released through the passthrough relay unless it was itself frozen as a
+    // grant-less passthrough. If its SQL became unanalyzable since execution (a dropped table/column →
+    // exception.unanalyzable), the live re-decision turns passthrough while the stored bytes still hold the
+    // columnar, possibly masked, result. A legacy result (null fingerprint) is likewise unverifiable. Both
+    // fail closed — only a present, grant-less fingerprint takes the raw-release path below.
+    val storedFingerprint = decrypted.resultFingerprint
+    if (ctx.passthrough && (storedFingerprint == null || storedFingerprint.grantsList.isNotEmpty())) {
+        return ResultViewDecision.Denied("stored result no longer matches the live query decision")
     }
     if (ctx.passthrough) {
         // The re-decision already ran full Cedar authorization under {R} in the viewer's live context and
@@ -254,10 +249,18 @@ internal fun decideResultView(
         }
         return ResultViewDecision.Allowed(decrypted.columns, decrypted.rows)
     }
-    if (
-        ctx.outputColumns.size != decrypted.columns.size ||
-        ctx.outputColumns.zip(decrypted.columns).any { (decided, stored) -> !decided.equals(stored, ignoreCase = true) }
-    ) {
+    // Apply the re-decided masks only when the frozen requirements still match the live re-decision — then
+    // each masked column keeps the same output ordinals, so ctx.masks bind to the same stored columns they
+    // did at execution ([resultFingerprint]). Any drift (a reorder, a namespace change, a legacy result with
+    // no frozen fingerprint) denies fail-closed. This does NOT freeze the mask FUNCTIONS or Cedar verdicts:
+    // masking is re-decided under {R} at view, so a policy that liberalizes between execute and view can
+    // still narrow (or widen) the masks — matched requirements only prove the ordinal binding is sound.
+    if (storedFingerprint == null || storedFingerprint != fingerprintOf(ctx.resultFingerprint)) {
+        return ResultViewDecision.Denied("stored result no longer matches the live query decision")
+    }
+    // The live projection must be the same width as the stored bytes a mask ordinal indexes into; this also
+    // denies a plan-shaped result (EXPLAIN emits no output columns) rather than releasing it raw.
+    if (ctx.outputColumns.size != decrypted.columns.size) {
         return ResultViewDecision.Denied("stored result columns no longer match the live query decision")
     }
     if (decrypted.rows.any { it.size != decrypted.columns.size }) {
@@ -357,10 +360,8 @@ fun Route.approvalRoutes(
 
     // Whether the caller may open a query-approval request against this datasource (task.request on the
     // Datasource). The shipped global permit keeps this open by default; an operator can forbid it per
-    // datasource. authDebug bypasses.
-    fun mayRequest(call: ApplicationCall, ds: Datasource): Boolean {
-        if (config.authDebug) return true
-        val principal = call.userSession()?.principal ?: "debug-user"
+    // datasource.
+    fun mayRequest(call: ApplicationCall, principal: String, ds: Datasource): Boolean {
         val roles = roleResolver.resolve(principal)
         val raw = call.httpAuthzContext(config)
         val tags = authz.resolveContextTags(principal, roles, ds.name, raw, ds.tags)
@@ -374,22 +375,18 @@ fun Route.approvalRoutes(
     // task.approve (approve/reject/execute under R) or task.read (metadata) against the Request —
     // scoped to its role/datasource, with
     // requester != approver enforced by the shipped no-self-approval forbid. Approver eligibility is a
-    // Cedar policy, never the datasource's approver GROUP. authDebug bypasses, matching every route.
+    // Cedar policy, never the datasource's approver GROUP.
     //
     // The console is a real surface, so it names itself: WORKFLOW_VIEWER, the same channel a result view
     // runs on. Deciding and viewing are both the unelevated human side of a task and are scoped together.
     // It must never be `editor` or `wire` — those two carry [system:task-editor-self-approve] /
     // [system:task-wire-self-approve], which permit self-approval because a machine task runs under the
     // caller's OWN roles. A human approval elevates to R, so it stays under the no-self-approval forbid.
-    fun mayDecide(call: ApplicationCall, action: AuthzAction, req: AccessRequest): Boolean {
-        if (config.authDebug) return true
+    fun mayDecide(call: ApplicationCall, principal: String, action: AuthzAction, req: AccessRequest): Boolean {
         val decision = authz.authorizeWithContext(
-            call.userSession()?.principal ?: "debug-user",
+            principal,
             action,
-            AuthzResource.ApprovalRequest(
-                requester = req.principal, approver = req.decidedBy, executedBy = req.executedBy,
-                datasourceName = req.datasourceName, roleName = req.roleName,
-            ),
+            req.toApprovalResource(),
             call.httpAuthzContext(config, Channel.WORKFLOW_VIEWER),
             req.datasourceName,
             req.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
@@ -400,14 +397,11 @@ fun Route.approvalRoutes(
     // Result rows require Cedar authority to assume the task's R. No authDebug bypass: this is data
     // confidentiality, enforced in development too. Same channel as [mayDecide] and as the per-column
     // re-decision the released rows go through, so one policy scopes the whole console surface.
-    fun mayReadResult(call: ApplicationCall, req: AccessRequest): Boolean {
+    fun mayReadResult(call: ApplicationCall, principal: String, req: AccessRequest): Boolean {
         val decision = authz.authorizeWithContext(
-            call.userSession()?.principal ?: "debug-user",
+            principal,
             AuthzAction.TASK_ASSUME,
-            AuthzResource.ApprovalRequest(
-                requester = req.principal, approver = req.decidedBy, executedBy = req.executedBy,
-                datasourceName = req.datasourceName, roleName = req.roleName,
-            ),
+            req.toApprovalResource(),
             call.httpAuthzContext(config, Channel.WORKFLOW_VIEWER),
             req.datasourceName,
             req.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
@@ -439,8 +433,7 @@ fun Route.approvalRoutes(
     }
 
     post("/api/approvals") {
-        if (!call.requireApi(config)) return@post
-        val principal = call.userSession()?.principal ?: "debug-user"
+        val principal = call.requireApi() ?: return@post
         val input = call.receive<CreateApprovalInput>()
         if (input.reason.isBlank()) return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.field_required", mapOf("fields" to "reason")))
 
@@ -475,7 +468,7 @@ fun Route.approvalRoutes(
             val ds = datasourceStore.list().firstOrNull { it.name == source.datasource }
                 ?: return@post call.respond(HttpStatusCode.Conflict, ApiError("common.not_found", mapOf("resource" to "datasource")))
             val datasourceId = ds.id
-            if (!mayRequest(call, ds)) {
+            if (!mayRequest(call, principal, ds)) {
                 return@post call.respond(HttpStatusCode.Forbidden, ApiError("common.forbidden"))
             }
             if (input.roleId == null) return@post call.respond(HttpStatusCode.BadRequest, ApiError("approval.role_required"))
@@ -484,7 +477,7 @@ fun Route.approvalRoutes(
                 accessStore.createQueryRequest(
                     principal = principal,
                     datasourceId = datasourceId,
-                    sql = source.statement,
+                    statements = listOf(source.statement),
                     denyReason = source.detail,
                     sourceDecisionId = sourceDecisionId,
                     reason = input.reason.trim(),
@@ -514,7 +507,7 @@ fun Route.approvalRoutes(
         val ds = datasourceStore.get(input.datasourceId!!)
             ?: return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "datasource")))
         val sql = input.sql!!
-        if (!mayRequest(call, ds)) {
+        if (!mayRequest(call, principal, ds)) {
             return@post call.respond(HttpStatusCode.Forbidden, ApiError("common.forbidden"))
         }
         if (input.roleId == null) return@post call.respond(HttpStatusCode.BadRequest, ApiError("approval.role_required"))
@@ -544,7 +537,7 @@ fun Route.approvalRoutes(
         val request = accessStore.createQueryRequest(
             principal = principal,
             datasourceId = ds.id,
-            sql = sql,
+            statements = listOf(sql),
             denyReason = if (decision.action == EnfAction.DENY) (decision.denyReason ?: decision.detail) else null,
             sourceDecisionId = null,
             reason = input.reason.trim(),
@@ -565,22 +558,19 @@ fun Route.approvalRoutes(
         call.respond(HttpStatusCode.Created, CreateApprovalResponse(request, wouldAllow = decision.action == EnfAction.ALLOW))
     }
 
-    // APPROVAL role discovery (approval-workflow.md — "the requester picks R"): evaluate Q under each
-    // candidate role and offer the ones that return MORE than the requester's own roles. A dry-run — no
-    // audit row is written.
+    // APPROVAL role discovery (approval-workflow.md — "the requester picks R"): evaluate the statement under
+    // each role and list every one it runs under, held or not. A dry-run — no audit row is written.
     post("/api/approvals/discover-roles") {
-        if (!call.requireApi(config)) return@post
-        val principal = call.userSession()?.principal ?: "debug-user"
+        val principal = call.requireApi() ?: return@post
         val input = call.receive<DiscoverRolesRequest>()
         val ds = datasourceStore.get(input.datasourceId)
             ?: return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "datasource")))
-        val ownRoles = roleResolver.resolve(principal)
-        // Resolve requester_ip ONCE here (the closure runs decideQuery per candidate role and posture).
+        // Resolve requester_ip ONCE here (the closure runs decideQuery per candidate role).
         val discoverContext = call.httpAuthzContext(config)
         // Candidates preview on WORKFLOW_EXECUTOR, the channel an approved query actually runs on. A grant
         // scoped to that channel — the shipped -259 PII unmask — is invisible from any other, so previewing
         // candidates elsewhere hides roles that would in fact work.
-        val response = discoverRoles(ownRoles, policyStore.listRoles()) { roles, channel ->
+        val response = discoverRoles(policyStore.listRoles()) { roles, channel ->
             decideQuery(
                 principal = principal, ds = ds, sql = input.sql, channel = channel,
                 catalog = datasourceStore.catalog(ds.id), policyStore = policyStore, accessStore = accessStore,
@@ -592,40 +582,38 @@ fun Route.approvalRoutes(
     }
 
     get("/api/approvals") {
-        if (!call.requireApi(config)) return@get
-        val principal = call.userSession()?.principal ?: "debug-user"
+        val principal = call.requireApi() ?: return@get
         call.respond(accessStore.listQueryRequests(status = call.request.queryParameters["status"], principal = principal))
     }
 
     get("/api/approvals/inbox") {
-        if (!call.requireApi(config)) return@get
+        val principal = call.requireApi() ?: return@get
         // Forward filter: every PENDING request the caller may approve (Cedar task.approve), not a
-        // group-membership join. authDebug shows all.
-        val requests = accessStore.listQueryRequests("PENDING", null).filter { mayDecide(call, AuthzAction.TASK_APPROVE, it) }
+        // group-membership join.
+        val requests = accessStore.listQueryRequests("PENDING", null).filter { mayDecide(call, principal, AuthzAction.TASK_APPROVE, it) }
         call.respond(requests)
     }
 
     get("/api/approvals/{id}") {
-        if (!call.requireApi(config)) return@get
+        val principal = call.requireApi() ?: return@get
         val id = call.idParam() ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val req = accessStore.getRequest(id)
         if (req == null || !req.isWorkflowApproval) return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "query approval request")))
-        val isApprover = mayDecide(call, AuthzAction.TASK_APPROVE, req)
+        val isApprover = mayDecide(call, principal, AuthzAction.TASK_APPROVE, req)
         // Task metadata is gated by task.read. Saved rows are separate and remain behind task.assume.
-        if (!mayDecide(call, AuthzAction.TASK_READ, req)) {
+        if (!mayDecide(call, principal, AuthzAction.TASK_READ, req)) {
             return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "query approval request")))
         }
         // task.read is a metadata gate; result-derived data stays behind task.assume. A caller who cannot
         // assume R sees execution status only (status/executor/timestamps/error) — never the result's row
         // count or output-column shape, which are cardinality/existence oracles the assume gate must close.
         val visibleMeta = queryResultStore?.meta(id)?.let { meta ->
-            if (mayReadResult(call, req)) meta else meta.copy(rowCount = null, columns = emptyList())
+            if (mayReadResult(call, principal, req)) meta else meta.copy(rowCount = null, columns = emptyList())
         }
         // Mirror /execute's gates: only the approver OF RECORD (decided_by) can run it, so a merely-eligible
         // approver who did not approve THIS task gets no Run affordance that would just 403.
         val canExecute = queryResultStore != null && isApprover && req.status == "APPROVED" && req.decidedBy == principal
-        val canCancel = req.status == "EXECUTING" && mayDecide(call, AuthzAction.TASK_CANCEL, req)
+        val canCancel = req.status == "EXECUTING" && mayDecide(call, principal, AuthzAction.TASK_CANCEL, req)
         call.respond(
             ApprovalDetail(
                 req,
@@ -638,15 +626,14 @@ fun Route.approvalRoutes(
     }
 
     post("/api/approvals/{id}/approve") {
-        if (!call.requireApi(config)) return@post
+        val principal = call.requireApi() ?: return@post
         val id = call.idParam() ?: return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val req = accessStore.getRequest(id)
         if (req == null || !req.isWorkflowApproval) return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "query approval request")))
         if (req.status != "PENDING") return@post call.respond(HttpStatusCode.Conflict, ApiError("approval.already_decided"))
         // Cedar owns the authorization: task.approve on this request, scoped to its role/datasource,
         // with requester != approver via the no-self-approval forbid.
-        if (!mayDecide(call, AuthzAction.TASK_APPROVE, req)) {
+        if (!mayDecide(call, principal, AuthzAction.TASK_APPROVE, req)) {
             return@post call.respond(HttpStatusCode.Forbidden, ApiError("approval.not_approver"))
         }
         // An approved QUERY request is executed under role R by an approver (execute-under-R); there is no
@@ -668,9 +655,8 @@ fun Route.approvalRoutes(
     }
 
     post("/api/approvals/{id}/reject") {
-        if (!call.requireApi(config)) return@post
+        val principal = call.requireApi() ?: return@post
         val id = call.idParam() ?: return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val body = call.receive<RejectInput>()
         if (body.reason.isBlank()) return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.field_required", mapOf("fields" to "reason")))
         val req = accessStore.getRequest(id)
@@ -678,7 +664,7 @@ fun Route.approvalRoutes(
         if (req.status != "PENDING") return@post call.respond(HttpStatusCode.Conflict, ApiError("approval.already_decided"))
         // Cedar owns the authorization: reject is the SAME task.approve decision as approve, scoped to its
         // role/datasource with requester != approver via the no-self-approval forbid.
-        if (!mayDecide(call, AuthzAction.TASK_APPROVE, req)) {
+        if (!mayDecide(call, principal, AuthzAction.TASK_APPROVE, req)) {
             return@post call.respond(HttpStatusCode.Forbidden, ApiError("approval.not_approver"))
         }
         val updated = accessStore.decideQueryRequest(
@@ -698,14 +684,13 @@ fun Route.approvalRoutes(
     }
 
     post("/api/approvals/{id}/cancel") {
-        if (!call.requireApi(config)) return@post
+        val principal = call.requireApi() ?: return@post
         val id = call.idParam() ?: return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val req = accessStore.getRequest(id)
         if (req == null || !req.isWorkflowApproval) {
             return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "query approval request")))
         }
-        if (!mayDecide(call, AuthzAction.TASK_CANCEL, req)) {
+        if (!mayDecide(call, principal, AuthzAction.TASK_CANCEL, req)) {
             return@post call.respond(HttpStatusCode.Forbidden, ApiError("approval.cancel_forbidden"))
         }
         when (req.status) {
@@ -738,9 +723,8 @@ fun Route.approvalRoutes(
     // ---- Execute under R ---------------------------------------------------------------
 
     post("/api/approvals/{id}/execute") {
-        if (!call.requireApi(config)) return@post
+        val executor = call.requireApi() ?: return@post
         val id = call.idParam() ?: return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val executor = call.userSession()?.principal ?: "debug-user"
         val req = accessStore.getRequest(id)
         if (req == null || !req.isWorkflowApproval) {
             return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "query approval request")))
@@ -748,7 +732,7 @@ fun Route.approvalRoutes(
         // Authorize (task.approve) BEFORE disclosing task state: a caller who cannot approve this task gets a
         // uniform 403 regardless of its status, so the 409 already_executed/not_approved distinctions below are
         // never a state oracle for a non-approver. The approver-of-record identity is still pinned further down.
-        if (!mayDecide(call, AuthzAction.TASK_APPROVE, req)) {
+        if (!mayDecide(call, executor, AuthzAction.TASK_APPROVE, req)) {
             return@post call.respond(HttpStatusCode.Forbidden, ApiError("approval.not_approver"))
         }
         if (req.status in setOf("EXECUTING", "EXECUTED", "FAILED", "CANCELLED")) {
@@ -806,9 +790,8 @@ fun Route.approvalRoutes(
     // exactly the task's execute-as role set in the viewer's workflow-viewer context. Every successful
     // view and live-decision denial is audited; a deactivated viewer is hidden and an expired result is Gone.
     get("/api/approvals/{id}/result") {
-        if (!call.requireApi(config)) return@get
+        val principal = call.requireApi() ?: return@get
         val id = call.idParam() ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val req = accessStore.getRequest(id)
         if (req == null || !req.isWorkflowApproval) return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "query approval request")))
         // Deprovisioning gate applies before result lookup. The live decideQuery path repeats this gate as
@@ -823,47 +806,37 @@ fun Route.approvalRoutes(
         val access = queryResultStore?.accessFor(id)
             ?: return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "query approval request")))
         val meta = access.meta
-        if (!mayReadResult(call, req)) {
+        if (!mayReadResult(call, principal, req)) {
             return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "query approval request")))
+        }
+        // One re-decision on access.sql (the released child's own statement, not req.sql) gates both the
+        // FAILED diagnostic and the DONE rows. Null withholds.
+        val ctx = viewerDecision(
+            principal, req, access.sql, call.httpAuthzContext(config),
+            datasourceStore, policyStore, accessStore, userGroupStore, roleResolver, authz,
+            systemClassification, Channel.WORKFLOW_VIEWER,
+        )
+        // The failure detail releases only here, behind the same gate as the rows (never on the metadata
+        // poll). Audit before responding so it is never returned unrecorded.
+        if (meta.status == "FAILED" && access.errorDetail != null) {
+            val viewEvent = when (principal) {
+                req.principal -> "result-failure-viewed-by-requester"
+                req.decidedBy -> "result-failure-viewed-by-approver"
+                else -> "result-failure-viewed-by-assumer"
+            }
+            auditStore.insert(e3Record(principal, req, viewEvent, Channel.WORKFLOW_VIEWER))
+            return@get call.respond(
+                QueryResultView(meta, emptyList(), emptyList(), errorDetail = failedDiagnosticForViewer(ctx, access.errorDetail)),
+            )
         }
         if (meta.status != "DONE") {
             return@get call.respond(HttpStatusCode.Conflict, ApiError("approval.result_not_ready"))
         }
         val decrypted = access.decrypted
             ?: return@get call.respond(HttpStatusCode.Gone, ApiError("approval.result_expired"))
-
-        // No raw side-channel: EVERY view re-decides under exactly the task's execute-as role set {R}
-        // (approval-execute-view-model). A row with an empty {R} — which a new request can never produce,
-        // since it must name its role — has no basis to re-decide under, so decideResultView denies it
-        // fail-closed rather than returning the stored bytes unmasked.
-        val viewDecision = when {
-            req.datasourceId == null -> ResultViewDecision.Denied("approval request has no datasource")
-            // Bind the re-decision to the SAME child whose bytes were just decrypted (access.sql), not the
-            // task's first-child req.sql — the two diverge once a task holds plural children.
-            access.sql == null -> ResultViewDecision.Denied("saved result child has no SQL")
-            else -> {
-                val ds = datasourceStore.get(req.datasourceId)
-                if (ds == null) {
-                    ResultViewDecision.Denied("approval request datasource no longer exists")
-                } else {
-                    decideResultView(
-                        viewer = principal,
-                        req = req,
-                        childSql = access.sql,
-                        ds = ds,
-                        decrypted = decrypted,
-                        callerContext = call.httpAuthzContext(config),
-                        datasourceStore = datasourceStore,
-                        policyStore = policyStore,
-                        accessStore = accessStore,
-                        userGroupStore = userGroupStore,
-                        roleResolver = roleResolver,
-                        authz = authz,
-                        systemClassification = systemClassification,
-                    )
-                }
-            }
-        }
+        val viewDecision =
+            if (ctx == null) ResultViewDecision.Denied("stored result has no live decision to re-mask under")
+            else decideResultView(ctx, decrypted)
         when (viewDecision) {
             is ResultViewDecision.Denied -> {
                 call.application.environment.log.warn(
@@ -940,6 +913,8 @@ internal suspend fun runApprovedTask(
         channel = channel.contextValue, kind = "approval_lifecycle",
     )
 
+    // The target-DB error behind a failure (both forms), stored so the FAILED view releases one per viewer.
+    var diagnostic: RunError? = null
     val failureCode = try {
         val response = runExecService.run(
             principal = executor,
@@ -956,7 +931,7 @@ internal suspend fun runApprovedTask(
         if (response.decision == EnfAction.DENY) {
             "approval.execute_denied"
         } else {
-            val result = DecryptedResult(response.columns, response.rows)
+            val result = DecryptedResult(response.columns, response.rows, response.rowsAffected, response.resultFingerprint)
             // Child DONE, parent EXECUTED, and the execution audit all commit in ONE transaction: a crash can
             // never leave a readable DONE child under a non-EXECUTED task. If the parent has left EXECUTING
             // (e.g. a restart already reconciled it to FAILED), the flip fails and aborts the whole commit —
@@ -983,6 +958,9 @@ internal suspend fun runApprovedTask(
         "query.no_proxy_attached"
     } catch (_: ProxyRunTimeoutException) {
         "query.proxy_timeout"
+    } catch (e: TargetDbRunException) {
+        diagnostic = e.toDiagnostic()
+        "approval.query_failed"
     } catch (_: ProxyRunException) {
         "approval.query_failed"
     } catch (t: Throwable) {
@@ -990,11 +968,10 @@ internal suspend fun runApprovedTask(
         "approval.query_failed"
     }
     if (failureCode != null) {
-        // Child FAILED and parent FAILED commit in ONE transaction (mirrors the success path's single-commit
-        // EXECUTED/DONE): a crash can never leave a FAILED child under a still-EXECUTING task, nor the
-        // inverse — the split that boot reconcile would otherwise have to repair.
-        runCatching { store.failRun(id, failureCode) { conn, _ -> accessStore.markFailed(id, conn) } }
-            .onFailure { log.error("task failure transition failed request=$id", it) }
+        // Child FAILED and parent FAILED commit in ONE transaction: a crash can never split them.
+        runCatching {
+            store.failRun(id, failureCode, diagnostic = diagnostic) { conn, _ -> accessStore.markFailed(id, conn) }
+        }.onFailure { log.error("task failure transition failed request=$id", it) }
     }
     // Push the ACTUAL terminal state (EXECUTED / FAILED / or CANCELLED if a cancel raced) to both parties'
     // SSE streams so a watching tab updates at once; best-effort, the tab also polls.

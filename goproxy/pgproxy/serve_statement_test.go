@@ -306,6 +306,36 @@ func TestRunSessionExecutePGTargetDbError(t *testing.T) {
 	}
 }
 
+func TestStreamResultTargetDbErrStaysProxyInternalWithBothForms(t *testing.T) {
+	core, closeCore := scriptedStreamCore(t, encodePG(t,
+		&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42P01", Message: "relation \"nope\" does not exist"},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'},
+	))
+	defer closeCore()
+	targetDbErr, _ := core.streamResult(nil, streamOpts{soft: true}, func(pgproto3.BackendMessage) error { return nil })
+	if targetDbErr == nil {
+		t.Fatal("expected a target-DB error from the ErrorResponse")
+	}
+	// streamResult also serves internal catalog probes/refetches (collectProbe), so its error must NOT be
+	// engine.TargetDbError — only RunSession.ServeStatement promotes the statement's OWN ERR. Otherwise a
+	// probe failure would be surfaced to a viewer as the query's error detail.
+	var eng engine.TargetDbError
+	if errors.As(targetDbErr, &eng) {
+		t.Fatal("streamResult tagged an ErrorResponse as engine.TargetDbError; a probe error would leak as error detail")
+	}
+	// It still carries BOTH forms for the statement site to promote: the raw message and the value-free strip.
+	var pgErr *pgTargetDbErr
+	if !errors.As(targetDbErr, &pgErr) {
+		t.Fatalf("targetDbErr = %T, want *pgTargetDbErr carrying both forms", targetDbErr)
+	}
+	if !strings.Contains(pgErr.message, "does not exist") {
+		t.Errorf("raw message = %q, want the verbatim target-DB text", pgErr.message)
+	}
+	if pgErr.redacted == "" || strings.Contains(pgErr.redacted, "nope") {
+		t.Errorf("redacted = %q, want a value-free form without the object name", pgErr.redacted)
+	}
+}
+
 func TestRunSessionExecutePGRejectsCopy(t *testing.T) {
 	response := encodePG(t, &pgproto3.CopyOutResponse{})
 	_, _, _, err := runSessionExecute(t, "COPY t TO STDOUT", 0, response)
@@ -346,7 +376,7 @@ func TestRunSessionExecutePGAllowsUTF8ParameterStatus(t *testing.T) {
 }
 
 func TestRunSessionExecutePGRejectsUnexpectedFrame(t *testing.T) {
-	response := encodePG(t, &pgproto3.BackendKeyData{ProcessID: 1, SecretKey: 2})
+	response := encodePG(t, &pgproto3.BackendKeyData{ProcessID: 1, SecretKey: []byte{0, 0, 0, 2}})
 	_, _, _, err := runSessionExecute(t, "SELECT 1", 0, response)
 	if err == nil || !strings.Contains(err.Error(), "unexpected") {
 		t.Fatalf("err = %v, want unexpected-frame rejection", err)
@@ -406,7 +436,7 @@ func TestRunSessionExecutePGSequentialQueriesDoNotSkew(t *testing.T) {
 // second Query to the target DB (so a swallowed best-effort probe error cannot let a later statement read the
 // failed statement's stale frames).
 func TestRunSessionExecutePGErrorPoisonsSession(t *testing.T) {
-	malformed := encodePG(t, &pgproto3.BackendKeyData{ProcessID: 1, SecretKey: 2})
+	malformed := encodePG(t, &pgproto3.BackendKeyData{ProcessID: 1, SecretKey: []byte{0, 0, 0, 2}})
 	be, _ := scriptedRunSession(t, malformed) // only the first statement is ever served
 
 	if _, _, _, err := be.execute("SELECT 1", 0); err == nil {

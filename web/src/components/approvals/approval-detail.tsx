@@ -4,7 +4,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { useTranslations } from 'next-intl'
 import useSWR, { mutate as globalMutate } from 'swr'
 import { toast } from 'sonner'
-import { cancelApproval, executeApproval, getApprovalResult, rejectApproval } from '@/lib/api/client'
+import { ApiError, cancelApproval, executeApproval, getApprovalResult, rejectApproval } from '@/lib/api/client'
 import { onTaskEvent, subscribeTaskEvents } from '@/lib/api/task-events'
 import { translateApiError } from '@/lib/i18n/errors'
 import { swrKeys, useApproval } from '@/lib/hooks'
@@ -124,9 +124,14 @@ export function ApprovalDetail({ id }: { id: number }) {
   const runStarted = result != null && result.status != null
   const canViewRows = result?.status === 'DONE'
 
+  // Only an expected absence (404 can't-assume, 409 not-ready) becomes null; a 5xx re-throws so SWR retries.
   const { data: resultView } = useSWR(
-    canViewRows ? (['approval-result', id] as const) : null,
-    () => getApprovalResult(id),
+    canViewRows || result?.status === 'FAILED' ? (['approval-result', id] as const) : null,
+    () =>
+      getApprovalResult(id).catch((e) => {
+        if (e instanceof ApiError && (e.status === 404 || e.status === 409)) return null
+        throw e
+      }),
   )
 
   // Task-event push: revalidate the moment this task terminalizes (execute done, cancel) instead of waiting
@@ -164,6 +169,10 @@ export function ApprovalDetail({ id }: { id: number }) {
       refresh()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t('approvalDetail.runFailed'))
+      // A run can commit (APPROVED → EXECUTING) server-side and still fail the response. Refresh so a stale
+      // APPROVED view does not re-enable Run and invite a duplicate submit; the server's CAS is the real
+      // guard, this keeps the UI honest.
+      refresh()
     } finally {
       setBusy(null)
     }
@@ -223,8 +232,12 @@ export function ApprovalDetail({ id }: { id: number }) {
                 >
                   {t('actions.reject')}
                 </Button>
-                <Button onClick={() => setApproveOpen(true)} disabled={busy !== null}>
-                  {t('actions.approve')}
+                <Button
+                  onClick={() => setApproveOpen(true)}
+                  disabled={busy !== null}
+                  className="bg-emerald-600 text-white hover:bg-emerald-700"
+                >
+                  {t('actions.approveAndRun')}
                 </Button>
               </div>
             )}
@@ -291,7 +304,11 @@ export function ApprovalDetail({ id }: { id: number }) {
                   <p className="text-muted-foreground text-sm">
                     {t('approvalDetail.runUnderRole', { principal: request.principal })}
                   </p>
-                  <Button onClick={handleRun} disabled={busy !== null}>
+                  <Button
+                    onClick={handleRun}
+                    disabled={busy !== null}
+                    className="bg-emerald-600 text-white hover:bg-emerald-700"
+                  >
                     {busy === 'run' ? t('actions.running') : t('actions.runQuery')}
                   </Button>
                 </div>
@@ -322,8 +339,11 @@ export function ApprovalDetail({ id }: { id: number }) {
                   </div>
 
                   {result.status === 'FAILED' && result.errorCode && (
-                    <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-500">
-                      {t('approvalDetail.failedCode', { code: translateApiError(result.errorCode) })}
+                    <div className="space-y-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-500">
+                      <div>{t('approvalDetail.failedCode', { code: translateApiError(result.errorCode) })}</div>
+                      {resultView?.errorDetail && (
+                        <div className="font-mono text-xs break-words opacity-80">{resultView.errorDetail}</div>
+                      )}
                     </div>
                   )}
 

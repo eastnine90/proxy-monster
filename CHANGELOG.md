@@ -1,5 +1,181 @@
 # Changelog
 
+## [0.1.23](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.22...server-v0.1.23) (2026-08-28)
+
+
+### Features
+
+* **goproxy:** carry both raw and redacted forms of a failed query's target-DB error ([#261](https://github.com/ridi-oss/proxy-monster/issues/261)) ([279ca2e](https://github.com/ridi-oss/proxy-monster/commit/279ca2e82df806e0e267613b42b580ac1e8eb3d2))
+
+
+### Bug Fixes
+
+* **control-plane:** refetch an unheld schema before relaying it unanalyzed ([#258](https://github.com/ridi-oss/proxy-monster/issues/258)) ([63ae665](https://github.com/ridi-oss/proxy-monster/commit/63ae665fbe945daf631b2a5310a751f1613399b8))
+
+
+### Refactoring
+
+* **analyzer:** fold identifiers once, up front, instead of per consumer ([#257](https://github.com/ridi-oss/proxy-monster/issues/257)) ([70bf790](https://github.com/ridi-oss/proxy-monster/commit/70bf790ad57d918cbd0e06aee83dc7379929c724))
+* **control-plane:** store a query result as protobuf, not kotlinx JSON ([#265](https://github.com/ridi-oss/proxy-monster/issues/265)) ([9ccff9e](https://github.com/ridi-oss/proxy-monster/commit/9ccff9e1ee8efdd5705b98292585d69dfb2639ff))
+
+
+### Build & Dependencies
+
+* **web:** commit the agent files next dev regenerates ([#260](https://github.com/ridi-oss/proxy-monster/issues/260)) ([a4ff9a4](https://github.com/ridi-oss/proxy-monster/commit/a4ff9a4b9d4d08716cf8ac86befa952dc905f25a))
+
+## [0.1.22](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.21...server-v0.1.22) (2026-08-24)
+
+
+### Bug Fixes
+
+* **control-plane:** gate stored-result views on a decision fingerprint, not column labels ([#229](https://github.com/ridi-oss/proxy-monster/issues/229)) ([#241](https://github.com/ridi-oss/proxy-monster/issues/241)) ([06c189c](https://github.com/ridi-oss/proxy-monster/commit/06c189c98cc6c288b4ef0956cb580f27c00becfd))
+
+## [0.1.21](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.20...server-v0.1.21) (2026-08-21)
+
+
+### Reverts
+
+* surface a failed query's target-DB error ([#202](https://github.com/ridi-oss/proxy-monster/issues/202)) ([#227](https://github.com/ridi-oss/proxy-monster/issues/227)) ([203ca88](https://github.com/ridi-oss/proxy-monster/commit/203ca88e720d2c5cb9e5e7767238ed98abea546e))
+
+
+### Build & Dependencies
+
+* **release:** recognize revert-type commits + cut server 0.1.21 ([#233](https://github.com/ridi-oss/proxy-monster/issues/233)) ([f57c488](https://github.com/ridi-oss/proxy-monster/commit/f57c4887897e4e9066e2234908ed4ab49e5aebdc))
+
+## [0.1.20](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.19...server-v0.1.20) (2026-08-20)
+
+
+### Bug Fixes
+
+* **analyzer:** allow VALUES() in INSERT … ON DUPLICATE KEY UPDATE ([#224](https://github.com/ridi-oss/proxy-monster/issues/224)) ([44944af](https://github.com/ridi-oss/proxy-monster/commit/44944af2a409ecdf49dc50615276c92603c0ff5b))
+* uncorrupt Slack reason links + one Approve & run button ([#226](https://github.com/ridi-oss/proxy-monster/issues/226)) ([94f99c0](https://github.com/ridi-oss/proxy-monster/commit/94f99c0bf4f34bc822c6e21daea0255a6819d8fb))
+
+## [0.1.19](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.18...server-v0.1.19) (2026-08-20)
+
+
+### Features
+
+* **control-plane:** surface a failed query's target-DB error, confidential like the rows ([#202](https://github.com/ridi-oss/proxy-monster/issues/202)) ([ef0c271](https://github.com/ridi-oss/proxy-monster/commit/ef0c271bce0a55ca3d2313b80cc93da141b03880))
+* **web:** list every role a query can run under, auto-discovered in the composer ([#201](https://github.com/ridi-oss/proxy-monster/issues/201)) ([b5d0280](https://github.com/ridi-oss/proxy-monster/commit/b5d02802fe2495a5ce8c403a3957a2db49f215be))
+
+
+### Bug Fixes
+
+* **goproxy:** hex BIT/GEOMETRY and any non-UTF-8 result cell ([#219](https://github.com/ridi-oss/proxy-monster/issues/219)) ([cf5069a](https://github.com/ridi-oss/proxy-monster/commit/cf5069ab0b1a45ab6876c5ce7aa705cedde31f61))
+* **mysqlproxy:** show binary values in web results ([#205](https://github.com/ridi-oss/proxy-monster/issues/205)) ([d785d9b](https://github.com/ridi-oss/proxy-monster/commit/d785d9b70206eb9cc2386813d2f68fd7477bc842))
+* **web:** reload the page on same-window identity changes ([#207](https://github.com/ridi-oss/proxy-monster/issues/207)) ([8456af7](https://github.com/ridi-oss/proxy-monster/commit/8456af70864172fd497f89487f9e6cf0ef5fcd0f))
+* **web:** session-routing e2e accepts the ?next= login redirect ([#199](https://github.com/ridi-oss/proxy-monster/issues/199)) ([efd69df](https://github.com/ridi-oss/proxy-monster/commit/efd69dfe2e0e3f7dbe5dc7fb377dcf3e14127869))
+
+
+### Build & Dependencies
+
+* bump mysqlwire to v0.1.4 in goproxy and pmon ([#220](https://github.com/ridi-oss/proxy-monster/issues/220)) ([d45f214](https://github.com/ridi-oss/proxy-monster/commit/d45f214010ac98df0ae9b4ae8e27ce23fe8dc6f9))
+
+## [0.1.18](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.17...server-v0.1.18) (2026-08-14)
+
+
+### Bug Fixes
+
+* **analyzer:** classify MySQL account management and keep its result viewable ([#200](https://github.com/ridi-oss/proxy-monster/issues/200)) ([a5b609b](https://github.com/ridi-oss/proxy-monster/commit/a5b609ba74630c467c5ba57a27641206661fb345))
+
+
+### Build & Dependencies
+
+* **deps:** bump the web group across 1 directory with 12 updates ([#184](https://github.com/ridi-oss/proxy-monster/issues/184)) ([2a57582](https://github.com/ridi-oss/proxy-monster/commit/2a57582f26c1ff02cb2dc91a42376f851e959330))
+* **deps:** bump typescript from 5.9.3 to 6.0.3 in /web ([#9](https://github.com/ridi-oss/proxy-monster/issues/9)) ([6f69117](https://github.com/ridi-oss/proxy-monster/commit/6f69117a304782f08f5830724285592f651546b3))
+
+## [0.1.17](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.16...server-v0.1.17) (2026-08-13)
+
+
+### Bug Fixes
+
+* **control-plane:** record a DML statement's affected-row count on the saved result ([#130](https://github.com/ridi-oss/proxy-monster/issues/130)) ([5d01b2c](https://github.com/ridi-oss/proxy-monster/commit/5d01b2c8f5bd2fac3aa563351e03acf0012a5199))
+
+
+### Build & Dependencies
+
+* **deps:** bump CI actions — checkout/setup-node/setup-go v7, setup-buildx v4, release-please v5 ([#194](https://github.com/ridi-oss/proxy-monster/issues/194)) ([c77ea17](https://github.com/ridi-oss/proxy-monster/commit/c77ea17ab83287bcce7268099968d3a8142ff5f7))
+* **deps:** bump gradle-wrapper from 8.14.5 to 9.6.1 ([#6](https://github.com/ridi-oss/proxy-monster/issues/6)) ([588b383](https://github.com/ridi-oss/proxy-monster/commit/588b383670f40a2e141e100b7349377d898ea884))
+* **deps:** bump mysqlwire to v0.1.3 in goproxy and pmon ([#196](https://github.com/ridi-oss/proxy-monster/issues/196)) ([54d0491](https://github.com/ridi-oss/proxy-monster/commit/54d049160706fd8c99683aa5caa97c4d29b76e44))
+* **deps:** bump the go group across 4 directories with 14 updates ([#181](https://github.com/ridi-oss/proxy-monster/issues/181)) ([47f3f3c](https://github.com/ridi-oss/proxy-monster/commit/47f3f3c57c7d2ceba31e201c3e2e7187ea28015f))
+* **deps:** bump the jvm group across 1 directory with 45 updates ([#195](https://github.com/ridi-oss/proxy-monster/issues/195)) ([95af897](https://github.com/ridi-oss/proxy-monster/commit/95af89772c16a9ae25d74c10e0aa38e8928e7329))
+
+## [0.1.16](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.15...server-v0.1.16) (2026-08-13)
+
+
+### Bug Fixes
+
+* **control-plane:** deliver both the requester's receipt and the approver message ([#188](https://github.com/ridi-oss/proxy-monster/issues/188)) ([f5515ec](https://github.com/ridi-oss/proxy-monster/commit/f5515ec48c4c817106c6e020d531de40a48ea724))
+
+
+### Refactoring
+
+* **control-plane:** build the approval authz resource from the request row ([#189](https://github.com/ridi-oss/proxy-monster/issues/189)) ([bce0163](https://github.com/ridi-oss/proxy-monster/commit/bce0163fed9f49fd6ea666be501e25128f9e902d))
+
+
+### Documentation
+
+* reclassify the Bind-coercion search_path limitation as accepted (out-of-scope UDF) ([#190](https://github.com/ridi-oss/proxy-monster/issues/190)) ([98b55d2](https://github.com/ridi-oss/proxy-monster/commit/98b55d29af60a8956480c49b6313399042897ca9))
+
+## [0.1.15](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.14...server-v0.1.15) (2026-08-13)
+
+
+### Features
+
+* **control-plane:** model EXPLAIN and table ANALYZE as metadata-output reads ([#175](https://github.com/ridi-oss/proxy-monster/issues/175)) ([2d58e3d](https://github.com/ridi-oss/proxy-monster/commit/2d58e3da420eaa125d275d537e0414ec2a35dc08))
+
+
+### Bug Fixes
+
+* **control-plane:** let a self-approving requester get the approver message ([#186](https://github.com/ridi-oss/proxy-monster/issues/186)) ([a6196ba](https://github.com/ridi-oss/proxy-monster/commit/a6196bacec39918dc89b6c3d2c33efb8f880736c))
+
+## [0.1.14](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.13...server-v0.1.14) (2026-08-12)
+
+
+### Features
+
+* **control-plane:** recut statement disclosure to omit|auto|full and notify the requester ([#182](https://github.com/ridi-oss/proxy-monster/issues/182)) ([bf1d6e2](https://github.com/ridi-oss/proxy-monster/commit/bf1d6e281bb463c3aa99a873d72752d4c614f7be))
+
+
+### Bug Fixes
+
+* **control-plane:** PM_AUTH_DEBUG is a login method, nothing else ([#174](https://github.com/ridi-oss/proxy-monster/issues/174)) ([2174b2c](https://github.com/ridi-oss/proxy-monster/commit/2174b2c92c85387c9b81b45fc88228075f38fca5))
+
+## [0.1.13](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.12...server-v0.1.13) (2026-08-11)
+
+
+### Bug Fixes
+
+* **control-plane:** close unmanifested system tables fail-closed (GHSA-j984-q948-4xq8) ([#170](https://github.com/ridi-oss/proxy-monster/issues/170)) ([064b31c](https://github.com/ridi-oss/proxy-monster/commit/064b31c08ffd303fd157442dbe3e561d776ca56a))
+* **control-plane:** gate per-datasource metadata on datasource.connect ([#171](https://github.com/ridi-oss/proxy-monster/issues/171)) ([a366c2b](https://github.com/ridi-oss/proxy-monster/commit/a366c2b64b3cd39dda06fb384e3100cc3cd1e9db))
+* **engine:** classify value-bearing system tables away from catalog ([#173](https://github.com/ridi-oss/proxy-monster/issues/173)) ([e15840d](https://github.com/ridi-oss/proxy-monster/commit/e15840ddc153d909b839891a6eae07b27789fc61))
+
+## [0.1.12](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.11...server-v0.1.12) (2026-08-11)
+
+
+### Features
+
+* **control-plane:** notification foundations (Cedar satisfiability + message catalog) ([#152](https://github.com/ridi-oss/proxy-monster/issues/152)) ([98a5d8c](https://github.com/ridi-oss/proxy-monster/commit/98a5d8c8ea48536d141c5ea1013742f342982b61))
+* **control-plane:** re-home the console on shutdown via an SSE drain ([#149](https://github.com/ridi-oss/proxy-monster/issues/149)) ([a1e817f](https://github.com/ridi-oss/proxy-monster/commit/a1e817f34d6722c0a1b893f969e431c071108e1c))
+* **control-plane:** the task-notification outbox and model ([#156](https://github.com/ridi-oss/proxy-monster/issues/156)) ([84d63d1](https://github.com/ridi-oss/proxy-monster/commit/84d63d1dada0352141fd7714fe48c4760d7e1a2a))
+* **control-plane:** version-gate the Events stream, not just Register ([#164](https://github.com/ridi-oss/proxy-monster/issues/164)) ([8627c1f](https://github.com/ridi-oss/proxy-monster/commit/8627c1ff1b57d6eb1de34ec7a3e49574fe94cdcd)), closes [#158](https://github.com/ridi-oss/proxy-monster/issues/158)
+* editor queries survive a proxy redeploy — drain in-flight + fail a cut/stalled run fast ([#160](https://github.com/ridi-oss/proxy-monster/issues/160)) ([a1054d2](https://github.com/ridi-oss/proxy-monster/commit/a1054d2f2792f46258fec6d8f5620668e3fdddb9))
+* gate every statement by category (control-plane + console) ([#136](https://github.com/ridi-oss/proxy-monster/issues/136)) ([f2aaa3a](https://github.com/ridi-oss/proxy-monster/commit/f2aaa3a506f855ab646d6d149245d5e49bd0c80e))
+* **goproxy:** abort the target-DB open when a run is closed or drained during it ([#162](https://github.com/ridi-oss/proxy-monster/issues/162)) ([9870599](https://github.com/ridi-oss/proxy-monster/commit/9870599e147f1a935890540c3af45ea2ad5a2ea2)), closes [#159](https://github.com/ridi-oss/proxy-monster/issues/159)
+* **goproxy:** graceful drain of client connections on shutdown ([#148](https://github.com/ridi-oss/proxy-monster/issues/148)) ([a7addc4](https://github.com/ridi-oss/proxy-monster/commit/a7addc42f022d86a5b9f673943d89134f18c2468))
+* Slack task-approval notifications (service → transport → wire → language) ([#155](https://github.com/ridi-oss/proxy-monster/issues/155)) ([cfca3b3](https://github.com/ridi-oss/proxy-monster/commit/cfca3b352d5cf7d789108724d15fa38db3253765))
+
+
+### Bug Fixes
+
+* **control-plane:** reject a missing proxy secret in production (GHSA-52x6-28h6-9pjw) ([#167](https://github.com/ridi-oss/proxy-monster/issues/167)) ([39ceb99](https://github.com/ridi-oss/proxy-monster/commit/39ceb99e27bd2b54700384bfad35a06220613e34))
+
+
+### Refactoring
+
+* **goproxy:** extract the shared wire-server core, dedup the MySQL/PostgreSQL brokers ([#151](https://github.com/ridi-oss/proxy-monster/issues/151)) ([24d1df2](https://github.com/ridi-oss/proxy-monster/commit/24d1df24d582e8d6d950ca1482392aaf6bb5bfba))
+* rename the "backend" target-DB vocabulary to target-DB ([#165](https://github.com/ridi-oss/proxy-monster/issues/165)) ([690953c](https://github.com/ridi-oss/proxy-monster/commit/690953cac6fc0463c96750bb646d356d916d9a8c))
+
 ## [0.1.11](https://github.com/ridi-oss/proxy-monster/compare/server-v0.1.10...server-v0.1.11) (2026-08-07)
 
 

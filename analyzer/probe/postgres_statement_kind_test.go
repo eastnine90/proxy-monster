@@ -32,8 +32,8 @@ func pgFacts(t *testing.T, sql string) *pb.StatementFacts {
 // maps more, these flip to real kinds — a diff on this table is the record of that progress.
 //
 // A few PostgreSQL-specific results worth knowing (verified here, not assumed):
-//   - EXPLAIN [ANALYZE] <query> unwraps to the inner query's kind (SELECT), and the control-plane's
-//     explainOfQuery guard handles the plan-vs-rows distinction.
+//   - EXPLAIN [ANALYZE] of a READ classifies as stmt.kind.explain (plan-only, read-shaped); an EXPLAIN of a
+//     WRITE keeps the write's own kind. An EXPLAIN's output is the plan, so it emits empty output_columns.
 //   - SELECT … INTO <newtable> classifies as SELECT (read), NOT create_table — it is CTAS-equivalent, so the
 //     read-side lineage/masking is what must cover it; the write side is not modelled as DDL here.
 //   - MERGE, and privilege GRANT/REVOKE ON <object>, are STMT_UNKNOWN (only GRANT <role> TO <user>, a bare
@@ -52,10 +52,10 @@ func TestPostgresStatementKind(t *testing.T) {
 		{"SELECT 1 EXCEPT SELECT 2", pb.StatementKind_STATEMENT_KIND_SET_OP},
 		{"VALUES (1), (2)", pb.StatementKind_STATEMENT_KIND_VALUES},
 		{"SELECT ssn FROM users FOR UPDATE", pb.StatementKind_STATEMENT_KIND_SELECT},
-		// SELECT … INTO is CTAS-equivalent but classifies as a read; EXPLAIN unwraps to its inner query.
+		// SELECT … INTO is CTAS-equivalent but classifies as a read; a plan-only EXPLAIN of a read is stmt.kind.explain.
 		{"SELECT id INTO newtab FROM users", pb.StatementKind_STATEMENT_KIND_SELECT_INTO},
-		{"EXPLAIN SELECT ssn FROM users", pb.StatementKind_STATEMENT_KIND_SELECT},
-		{"EXPLAIN ANALYZE SELECT ssn FROM users", pb.StatementKind_STATEMENT_KIND_SELECT},
+		{"EXPLAIN SELECT ssn FROM users", pb.StatementKind_STATEMENT_KIND_EXPLAIN},
+		{"EXPLAIN ANALYZE SELECT ssn FROM users", pb.StatementKind_STATEMENT_KIND_EXPLAIN},
 		// TABLE <name> (a PostgreSQL SELECT shorthand) is not structured as a query.
 		{"TABLE users", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
 
@@ -125,8 +125,10 @@ func TestPostgresStatementKind(t *testing.T) {
 		{"CREATE TYPE ty AS ENUM ('a', 'b')", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
 		{"CREATE DOMAIN dom AS INT", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
 		{"CREATE EXTENSION ext", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
-		{"CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
-		{"CREATE PROCEDURE p() AS $$ BEGIN END $$ LANGUAGE plpgsql", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
+		// A dollar-quoted body is an opaque Heredoc — no lineage into it — but the CREATE itself now
+		// classifies, so policy gates it as its own DDL kind rather than through the unknown catch-all.
+		{"CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql", pb.StatementKind_STATEMENT_KIND_CREATE_FUNCTION},
+		{"CREATE PROCEDURE p() AS $$ BEGIN END $$ LANGUAGE plpgsql", pb.StatementKind_STATEMENT_KIND_CREATE_PROCEDURE},
 		{"CREATE RULE r AS ON INSERT TO users DO NOTHING", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
 		{"CREATE POLICY pol ON users USING (true)", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
 		{"CREATE FOREIGN TABLE ft (id INT) SERVER srv", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},

@@ -27,6 +27,7 @@ class ConfigGuardTest {
         "PM_OIDC_CLIENT_ID" to "cid",
         "PM_OIDC_CLIENT_SECRET" to "secret",
         "PM_OIDC_REDIRECT_URI" to "https://proxy.example.com/auth/oidc/callback",
+        "PM_SECRET_TOKEN" to "proxy-shared-secret",
         *pairs,
     )
 
@@ -44,6 +45,16 @@ class ConfigGuardTest {
         assertFailsWith<IllegalArgumentException> { Config.fromEnv(envOf("PM_QUERY_TIMEOUT" to "-1")) }
         // A set-but-non-numeric value fails fast rather than silently defaulting to 600.
         assertFailsWith<IllegalArgumentException> { Config.fromEnv(envOf("PM_QUERY_TIMEOUT" to "abc")) }
+    }
+
+    @Test fun `PM_NOTIFY_STATEMENT takes omit auto full, coerces legacy truncated, rejects the rest`() {
+        assertEquals("auto", Config.fromEnv(envOf()).notifyStatement, "default is auto")
+        assertEquals("omit", Config.fromEnv(envOf("PM_NOTIFY_STATEMENT" to "omit")).notifyStatement)
+        assertEquals("full", Config.fromEnv(envOf("PM_NOTIFY_STATEMENT" to "FULL")).notifyStatement)
+        // The removed `truncated` must not fail boot — it coerces to `auto` (logged).
+        assertEquals("auto", Config.fromEnv(envOf("PM_NOTIFY_STATEMENT" to "truncated")).notifyStatement)
+        // Anything else is a config error, not a silent default.
+        assertFailsWith<IllegalArgumentException> { Config.fromEnv(envOf("PM_NOTIFY_STATEMENT" to "sometimes")) }
     }
 
     @Test fun `PM_QUERY_TIMEOUT is bounded to the proxy's duration-safe ceiling (no ms overflow)`() {
@@ -166,6 +177,34 @@ class ConfigGuardTest {
                 ),
             )
         }
+    }
+
+    @Test fun `debug off requires a non-blank proxy secret`() {
+        assertFailsWith<IllegalArgumentException> { Config.fromEnv(productionEnv("PM_SECRET_TOKEN" to "")) }
+        assertFailsWith<IllegalArgumentException> { Config.fromEnv(productionEnv("PM_SECRET_TOKEN" to "   ")) }
+        // The actual advisory case: the key entirely absent (env() returns null). productionEnv always sets
+        // it, so build a production env without it to pin that the null path fails closed too.
+        assertFailsWith<IllegalArgumentException> {
+            Config.fromEnv(
+                envOf(
+                    "PM_AUTH_DEBUG" to "false",
+                    "PM_MCP_RESOURCE" to "https://proxy.example.com/mcp",
+                    "PM_SESSION_SECRET" to "x".repeat(32),
+                    "PM_OIDC_ISSUER" to "https://idp.example.com",
+                    "PM_OIDC_CLIENT_ID" to "cid",
+                    "PM_OIDC_CLIENT_SECRET" to "secret",
+                    "PM_OIDC_REDIRECT_URI" to "https://proxy.example.com/auth/oidc/callback",
+                ),
+            )
+        }
+    }
+
+    @Test fun `debug off with a valid proxy secret boots and preserves it`() {
+        assertEquals("proxy-shared-secret", Config.fromEnv(productionEnv()).secretToken)
+    }
+
+    @Test fun `debug mode preserves the configured proxy secret value verbatim`() {
+        assertEquals("   ", Config.fromEnv(envOf("PM_SECRET_TOKEN" to "   ")).secretToken)
     }
 
     @Test fun `debug off requires secure canonical MCP origins`() {

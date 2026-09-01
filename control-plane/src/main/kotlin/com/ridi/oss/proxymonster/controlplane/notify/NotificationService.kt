@@ -27,7 +27,6 @@ class NotificationService(
     private val queryResultStore: QueryResultStore?,
     private val webBaseUrl: String,
     private val disclosure: StatementDisclosure,
-    private val statementMaxChars: Int,
     private val defaultLocale: String,
 ) {
     private val log = LoggerFactory.getLogger(NotificationService::class.java)
@@ -77,19 +76,24 @@ class NotificationService(
     fun emit(c: Connection, event: NotificationEvent, req: AccessRequest) {
         if (!enabled) return
         runCatching {
-            val targets = when (event) {
-                // Only a pending request goes to the freshly-computed eligible approvers.
-                NotificationEvent.TASK_REQUESTED -> recipients.recipientsFor(req)
-                // Every later event edits the messages of exactly the people who were TOLD about the request.
-                // Recomputing eligibility would skip an approver whose role was revoked since, leaving their
-                // live "needs approval" buttons in place forever — and address someone who never saw it. Plus
-                // the parties, told how their own request ended regardless of approval authority.
-                else -> store.recipientsOfRequest(c, req.id) +
-                    listOfNotNull(req.principal, req.decidedBy, req.executedBy).filter { it.isNotBlank() }
+            val targets: List<Pair<String, NotificationKind>> = when (event) {
+                // emit() only carries later events; a pending request is enqueued by emitRequested. Kept total.
+                NotificationEvent.TASK_REQUESTED -> recipients.recipientsFor(req).map { it to NotificationKind.APPROVER }
+                // Every later event edits the threads of exactly the people who were TOLD about the request —
+                // the approver side is those who got it (recomputing eligibility would skip an approver whose
+                // role was revoked since, stranding their live buttons), the requester side is the requester's
+                // own receipt. A self-approving requester holds both threads and both are updated.
+                else -> buildList {
+                    for (r in store.recipientsOfRequest(c, req.id)) add(r to NotificationKind.APPROVER)
+                    for (r in listOfNotNull(req.decidedBy, req.executedBy).filter { it.isNotBlank() }) {
+                        add(r to NotificationKind.APPROVER)
+                    }
+                    add(req.principal to NotificationKind.REQUESTER)
+                }
             }
             for (transport in transports) {
-                for (recipient in targets) {
-                    store.enqueue(c, req.id, event, transport.name, recipient)
+                for ((recipient, kind) in targets) {
+                    store.enqueue(c, req.id, event, transport.name, recipient, kind)
                 }
             }
         }.onFailure { log.warn("notification emit failed task={} event={}", req.id, event.wire, it) }
@@ -120,10 +124,14 @@ class NotificationService(
                 status = "PENDING",
                 createdAt = "",
             )
+            val approvers = recipients.recipientsFor(subject)
             for (transport in transports) {
-                for (recipient in recipients.recipientsFor(subject)) {
-                    store.enqueue(c, taskId, NotificationEvent.TASK_REQUESTED, transport.name, recipient)
+                for (recipient in approvers) {
+                    store.enqueue(c, taskId, NotificationEvent.TASK_REQUESTED, transport.name, recipient, NotificationKind.APPROVER)
                 }
+                // The requester always gets their own receipt. When they are also an approver it is a separate
+                // thread from their approver message (distinct kind), so both are delivered, not deduped.
+                store.enqueue(c, taskId, NotificationEvent.TASK_SUBMITTED, transport.name, requester, NotificationKind.REQUESTER)
             }
         }.onFailure { log.warn("notification emit failed task={} event=task.requested", taskId, it) }
     }
@@ -176,7 +184,7 @@ class NotificationService(
 
         val locale = store.localeOf(row.recipient) ?: defaultLocale
         val message = buildMessage(row, req, transport)
-        val existingRef = store.externalRef(row.taskId, transport.name, row.recipient)
+        val existingRef = store.externalRef(row.taskId, transport.name, row.recipient, row.kind)
 
         // A non-update row that already left a ref was delivered by a prior attempt whose markSent did not
         // commit (the post succeeded, then the bookkeeping failed). Re-posting would double-send and strand
@@ -203,7 +211,7 @@ class NotificationService(
 
         when (result) {
             is DeliveryResult.Sent -> {
-                store.rememberMessage(row.taskId, transport.name, row.recipient, result.externalRef)
+                store.rememberMessage(row.taskId, transport.name, row.recipient, row.kind, result.externalRef)
                 store.markSent(row.id)
             }
             is DeliveryResult.Drop -> store.markDead(row.id, result.reason)
@@ -224,13 +232,30 @@ class NotificationService(
     fun localeOf(principal: String): String? = store.localeOf(principal)
 
     private fun buildMessage(row: OutboxRow, req: AccessRequest, transport: NotificationTransport): NotificationMessage {
-        // A statement whose predicate compares a literal against a CLASSIFIED column is withheld whatever the
-        // configured mode: the protected value is in the query text itself, where masking never reaches it.
-        // Advisory and reader-neutral; NULL (never analyzed) is treated the same way — an unanalyzable
-        // statement is not evidence of a safe one.
-        val effectiveDisclosure =
-            if (req.statementCarriesProtectedLiteral != false) StatementDisclosure.OMIT else disclosure
-        val statement = renderStatement(req.sql, effectiveDisclosure, statementMaxChars, transport.statementHardLimit)
+        // The disclosure decision: mode × event × hint. The hint (statementCarriesProtectedLiteral) flags a
+        // predicate comparing a literal against a CLASSIFIED column — a protected value sitting in the query
+        // text, where masking never reaches it; NULL (never analyzed) counts as "might carry one". AUTO shows
+        // only a cleared statement. FULL shows it to PENDING approvers regardless, then — once the task is
+        // handled (every other event) — falls back to AUTO, so a PII value does not persist in the channel.
+        // The requester's own receipt (SUBMITTED) never carries the statement: they authored it, and keeping
+        // it out leaves that message disclosure-free.
+        val cleared = req.statementCarriesProtectedLiteral == false
+        // `pending` is the LIVE task state, not merely the request event: a backed-off task.requested that
+        // finally delivers after the task was decided must not be the first to surface a flagged statement
+        // under FULL. Once the status leaves PENDING, FULL falls back to the hint like every handled message.
+        val pending = row.event == NotificationEvent.TASK_REQUESTED && req.status == "PENDING"
+        val show = row.event != NotificationEvent.TASK_SUBMITTED &&
+            discloseStatement(disclosure, pending = pending, cleared = cleared)
+        val statement = renderStatement(req.sql, show, transport.statementHardLimit)
+        // The requester's receipt names who was actually asked — the durable task.requested recipients, not a
+        // fresh eligibility recompute that role churn between enqueue and delivery could drift from (and that
+        // would re-run Cedar per candidate). Plain identities, resolved to display by the transport without an
+        // `<@id>` ping, since each already got their own message.
+        val notifiedApprovers = if (row.event == NotificationEvent.TASK_SUBMITTED) {
+            store.recipientsOfRequest(req.id).filter { it != req.principal }.sorted()
+        } else {
+            emptyList()
+        }
         // Result-derived facts (row count, error code) are a cardinality/existence oracle, so they go only to
         // the two identities that authored the run — the requester and the principal who actually executed it.
         // A merely eligible co-approver hears that the task finished, never how many rows it returned.
@@ -255,6 +280,7 @@ class NotificationService(
             errorCode = meta?.errorCode,
             deepLink = URLBuilder(webBaseUrl).appendPathSegments("workflows", req.id.toString()).buildString(),
             actions = actionsFor(row.event, req, statement),
+            notifiedApprovers = notifiedApprovers,
         )
     }
 

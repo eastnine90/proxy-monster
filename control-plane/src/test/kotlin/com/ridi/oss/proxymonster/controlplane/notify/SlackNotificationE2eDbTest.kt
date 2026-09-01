@@ -5,6 +5,7 @@ import com.ridi.oss.proxymonster.controlplane.AppUserInput
 import com.ridi.oss.proxymonster.controlplane.Config
 import com.ridi.oss.proxymonster.controlplane.ControlPlaneCore
 import com.ridi.oss.proxymonster.controlplane.CreateApprovalResponse
+import com.ridi.oss.proxymonster.controlplane.PRINCIPAL_SESSION_STORE
 import com.ridi.oss.proxymonster.controlplane.PrincipalSessionStore
 import com.ridi.oss.proxymonster.controlplane.QueryResultStore
 import com.ridi.oss.proxymonster.controlplane.ResultCrypto
@@ -20,6 +21,8 @@ import com.ridi.oss.proxymonster.controlplane.runApprovedTask
 import com.ridi.oss.proxymonster.controlplane.support.EnforcementFixture
 import com.ridi.oss.proxymonster.controlplane.support.MockSlack
 import com.ridi.oss.proxymonster.controlplane.support.requireDockerOrSkip
+import com.ridi.oss.proxymonster.controlplane.support.testLoginRoute
+import com.ridi.oss.proxymonster.controlplane.support.webSessionCookie
 import com.ridi.oss.proxymonster.grpc.ControlPlaneGrpcKt
 import com.ridi.oss.proxymonster.grpc.EnfAction as WireEnfAction
 import com.ridi.oss.proxymonster.grpc.ProxyRunMsg
@@ -37,6 +40,7 @@ import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation as ClientContentNegotiation
+import io.ktor.client.plugins.cookies.HttpCookies
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.http.ContentType
@@ -46,6 +50,7 @@ import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.install
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.routing.routing
+import io.ktor.server.sessions.Sessions
 import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import kotlinx.coroutines.CoroutineScope
@@ -67,6 +72,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.slf4j.LoggerFactory
@@ -100,14 +106,22 @@ class SlackNotificationE2eDbTest {
     private lateinit var http: HttpClient
     private lateinit var svc: NotificationService
     private lateinit var socket: SlackSocketMode
+    private lateinit var sessionStore: PrincipalSessionStore
 
-    // The compose route runs under authDebug, so the requester is the literal debug principal; the Slack click
-    // resolves the approver's verified email to its own active app_user principal.
-    private val requester = "debug-user"
+    // The requester signs in to the compose route; the Slack click resolves the approver's verified email to
+    // its own active app_user principal.
+    private val requester = "dev@example.com"
     private val approver = "admin@example.com"
     private var runnerRoleId = 0L
     private val runScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val log = LoggerFactory.getLogger("e2e")
+
+    // The class shares one MockSlack (@BeforeAll), so drop its recorded call log per test — every case then
+    // counts only its own posts, instead of accumulating across the class in method-order-dependent ways.
+    @BeforeEach
+    fun resetSlackLog() {
+        slack.clearRecorded()
+    }
 
     @BeforeAll
     fun setup() {
@@ -116,8 +130,9 @@ class SlackNotificationE2eDbTest {
         core = ControlPlaneCore(fx.dataSource)
         resultStore = QueryResultStore(fx.dataSource, ResultCrypto(ByteArray(32) { it.toByte() }))
         runExecService = RunExecService(core)
+        sessionStore = PrincipalSessionStore(fx.dataSource, null)
         config = Config(
-            httpPort = 0, dbUrl = "", dbUser = "", dbPassword = "", authDebug = true, secretToken = null,
+            httpPort = 0, dbUrl = "", dbUser = "", dbPassword = "", authDebug = false, secretToken = null,
             sessionSecret = "e2e-test-secret", oidc = null, resultKey = null, scimToken = null,
             sessionWindowSeconds = 3600, idpRecheckIntervalSeconds = 600, devMarker = true,
         )
@@ -152,8 +167,9 @@ class SlackNotificationE2eDbTest {
             accessStore = core.accessStore,
             queryResultStore = resultStore,
             webBaseUrl = "https://console.example",
-            disclosure = StatementDisclosure.FULL,
-            statementMaxChars = 10_000,
+            // `auto`, the default: a cleared statement is shown (approve-and-run offered), a flagged one is
+            // withheld (no button). The two E2E cases below exercise both branches on the real hint path.
+            disclosure = StatementDisclosure.AUTO,
             defaultLocale = "en",
         )
         val handler = SlackDecisionHandler(
@@ -204,10 +220,14 @@ class SlackNotificationE2eDbTest {
         }
     }
 
-    private fun ApplicationTestBuilder.wire(): HttpClient {
+    /** The compose route plus a client already signed in as [requester]. */
+    private suspend fun ApplicationTestBuilder.wire(): HttpClient {
         application {
+            attributes.put(PRINCIPAL_SESSION_STORE, sessionStore)
             install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true; encodeDefaults = true }) }
+            install(Sessions) { webSessionCookie(sessionStore, config.sessionSecret) }
             routing {
+                testLoginRoute(sessionStore, config)
                 approvalRoutes(
                     config, core.accessStore, core.auditStore, core.datasourceStore, core.policyStore,
                     core.userGroupStore, resultStore, core.roleResolver, core.authz, runExecService,
@@ -215,10 +235,13 @@ class SlackNotificationE2eDbTest {
                 )
             }
         }
-        return createClient {
+        val client = createClient {
             expectSuccess = false
+            install(HttpCookies)
             install(ClientContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
         }
+        assertEquals(HttpStatusCode.NoContent, client.post("/test/session/$requester").status)
+        return client
     }
 
     private suspend fun awaitUntil(what: String, predicate: () -> Boolean) {
@@ -346,5 +369,91 @@ class SlackNotificationE2eDbTest {
             post.actionElements().none { it["action_id"]?.jsonPrimitive?.content == SlackTransport.ACTION_APPROVE },
             "a withheld statement offers no approve-and-run — you cannot vouch for what you cannot read",
         )
+    }
+
+    /**
+     * The mode is a property of the draining service, not the enqueued row, so a FULL-mode drainer renders the
+     * same flagged request the AUTO case above withholds. FULL shows it to a pending approver on purpose — they
+     * must read it to decide — where AUTO never would. The hint reasserts itself once the task is handled
+     * (discloseStatement, unit-tested); the withhold render path is the same one the AUTO case exercises.
+     */
+    @Test
+    fun `under full a pending approver sees even a flagged statement`() = testApplication {
+        val fullSvc = NotificationService(
+            store = NotificationStore(fx.dataSource),
+            recipients = RecipientResolver(core.authz, core.roleResolver) { listOf(approver) },
+            transports = listOf(SlackTransport(http, "xoxb-e2e", "https://console.example", NotificationRenderer(), api = slack.apiBase)),
+            accessStore = core.accessStore,
+            queryResultStore = resultStore,
+            webBaseUrl = "https://console.example",
+            disclosure = StatementDisclosure.FULL,
+            defaultLocale = "en",
+        )
+        val client = wire()
+        assertEquals(HttpStatusCode.Created, client.createApproval("SELECT id FROM users WHERE ssn = '987-65-4320'").status)
+
+        fullSvc.drainOnce()
+        val post = slack.lastRequest("chat.postMessage")!!
+        assertTrue(
+            post.sectionText().contains("987-65-4320"),
+            "full shows a pending approver the whole statement, flagged or not — they must read it to decide",
+        )
+        assertTrue(
+            post.actionElements().any { it["action_id"]?.jsonPrimitive?.content == SlackTransport.ACTION_APPROVE },
+            "a fully-shown statement offers approve-and-run",
+        )
+    }
+
+    /**
+     * The one person who is BOTH requester and approver (self-approval) gets both messages, and a decision
+     * edits both — over the real Slack wire, not just the store. The delivery model keyed each message and its
+     * handle by (task, transport, recipient), so this person's own receipt used to dedup against their approver
+     * message and never post; this exercises that end to end (real Cedar routing, real Postgres, real
+     * SlackTransport → mock Slack). The approver is already a system:admin registered in mock Slack, so a
+     * request they file themselves is a self-approver with no extra setup.
+     */
+    @Test
+    fun `a self-approving requester gets both the approver message and their own receipt over Slack`() {
+        val selfSvc = NotificationService(
+            store = NotificationStore(fx.dataSource),
+            recipients = RecipientResolver(core.authz, core.roleResolver) { listOf(approver) },
+            transports = listOf(SlackTransport(http, "xoxb-e2e", "https://console.example", NotificationRenderer(), api = slack.apiBase)),
+            accessStore = core.accessStore,
+            queryResultStore = resultStore,
+            webBaseUrl = "https://console.example",
+            disclosure = StatementDisclosure.AUTO,
+            defaultLocale = "en",
+        )
+        val task = core.accessStore.createQueryRequest(
+            principal = approver,
+            datasourceId = fx.datasource.id,
+            statements = listOf("SELECT id FROM users"),
+            denyReason = null,
+            sourceDecisionId = null,
+            reason = "audit",
+            title = "read",
+            evaluatedDecision = "ALLOW",
+            roleId = runnerRoleId,
+            carriesProtectedLiteral = false,
+        )
+        runBlocking {
+            fx.dataSource.connection.use { c -> selfSvc.emitRequested(c, task.id, approver, fx.datasource, task.roleName) }
+            selfSvc.drainOnce()
+        }
+        val posts = slack.requestsFor("chat.postMessage")
+        assertEquals(2, posts.size, "the self-approver gets BOTH the approver message and their own receipt, not one deduped into the other")
+        assertEquals(
+            1,
+            posts.count { p -> p.actionElements().any { it["action_id"]?.jsonPrimitive?.content == SlackTransport.ACTION_APPROVE } },
+            "exactly one carries approve-and-run — the approver copy; the receipt has no buttons",
+        )
+
+        // A decision edits BOTH threads in place — again over the wire, not one update swallowing the other.
+        slack.clearRecorded()
+        runBlocking {
+            fx.dataSource.connection.use { c -> selfSvc.emit(c, NotificationEvent.TASK_DECIDED, core.accessStore.getRequest(task.id)!!) }
+            selfSvc.drainOnce()
+        }
+        assertEquals(2, slack.requestsFor("chat.update").size, "the decision edits both the approver message and the receipt")
     }
 }

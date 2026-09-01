@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.4](https://github.com/ridi-oss/proxy-monster/compare/mysqlwire/v0.1.3...mysqlwire/v0.1.4) (2026-08-20)
+
+
+### Bug Fixes
+
+* **mysqlproxy:** show binary values in web results ([#205](https://github.com/ridi-oss/proxy-monster/issues/205)) ([d785d9b](https://github.com/ridi-oss/proxy-monster/commit/d785d9b70206eb9cc2386813d2f68fd7477bc842))
+
+## [0.1.3](https://github.com/ridi-oss/proxy-monster/compare/mysqlwire/v0.1.2...mysqlwire/v0.1.3) (2026-08-13)
+
+
+### Refactoring
+
+* rename the "backend" target-DB vocabulary to target-DB ([#165](https://github.com/ridi-oss/proxy-monster/issues/165)) ([690953c](https://github.com/ridi-oss/proxy-monster/commit/690953cac6fc0463c96750bb646d356d916d9a8c))
+
 ## [0.1.2](https://github.com/ridi-oss/proxy-monster/compare/mysqlwire/v0.1.1...mysqlwire/v0.1.2) (2026-08-05)
 
 

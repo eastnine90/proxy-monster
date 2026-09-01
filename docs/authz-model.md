@@ -341,7 +341,7 @@ of a route and the gate it calls. Paths are relative to
 | Audit ingest (from the proxy) | `/api/ingest/decision` | `App.kt` | `X-PM-Ingest-Token` vs `PM_SECRET_TOKEN`; open when that env is unset (dev only) |
 | Audit read | `/api/audit`, `/api/audit/{id}` | `AuditRoutes.kt` | `requireApi` + Cedar `audit.read` — allow on `AuditLog` returns all rows, else own rows only |
 | Caller capability summary | `/api/me/permissions` | `App.kt` | `requireApi`; UI convenience, computed from `admin.*` + `audit.read` |
-| Datasources, catalog, classification | `/api/datasources**` | `Datasources.kt` | mixed: list = `requireApiOrBearer`; `live`, `{id}` = `requireApi`; `{id}/catalog` = `requireApi` + `datasource.connect`; rest = `requireAdmin(admin.datasources)` |
+| Datasources, catalog, classification | `/api/datasources**` | `Datasources.kt` | mixed: list = `requireApiOrBearer`, redacting non-connectable rows; `live` = `requireApi`; `{id}`, `{id}/catalog`, `{id}/wire-cert`, `{id}/table-detail` = `requireApiOrBearer` + `datasource.connect`; rest = `requireAdmin(admin.datasources)` |
 | One-shot editor query | `/api/datasources/{id}/query` | `Query.kt` | `requireApi`, then the per-statement `decideQuery` |
 | Editor sessions and tasks | `/api/editor/**` | `Query.kt` | `requireApi` + owner scope; cancel adds `task.cancel`, result adds `task.assume` |
 | Task-completion SSE | `/api/tasks/events` | `App.kt` | resolves the session itself; each push re-filtered through `task.read` |
@@ -354,9 +354,10 @@ of a route and the gate it calls. Paths are relative to
 | Users, groups, group-to-role map | `/api/users**`, `/api/groups**` | `Users.kt` | `requireAdmin(admin.identity)` |
 | Cedar policies | `/api/policies**` | `authz/CedarPolicyStore.kt` | `requireAdmin(admin.policies)` |
 
-- `requireApi(config)` (`Datasources.kt`) — a live web session, or
-  `PM_AUTH_DEBUG`. Authentication only, no authorization. Routes behind it do
-  their own per-row Cedar filtering (audit, tasks, grants).
+- `requireApi()` (`Datasources.kt`) — a live web session, returning the caller
+  principal so a route never re-reads it behind an assertion. Authentication
+  only, no authorization. Routes behind it do their own per-row Cedar filtering
+  (audit, tasks, grants).
 - `requireAdmin(config, authz, action)` (`authz/Authz.kt`) — a session plus
   `authorize(principal, admin.datasources | admin.policies | admin.identity, System) == Allow`.
   401 (`common.unauthenticated`) without a session, 403 (`common.forbidden`,
@@ -369,8 +370,16 @@ of a route and the gate it calls. Paths are relative to
   constant-time compared, TLS-only. Not a session and not Cedar: this is an
   IdP-to-control-plane integration ([`auth-model.md`](./auth-model.md)).
 
-`PM_AUTH_DEBUG` short-circuits all four to allow. It is a full authentication
-bypass and must be off in production.
+`PM_AUTH_DEBUG` is an authentication setting: it enables one extra **login
+method**, `POST /auth/debug`, which signs in as any principal with any roles and
+mints a real session row with real role assignments, exactly as the OIDC
+callback does. Keep it off in production — that login lets the caller name its
+own identity.
+
+A session it mints is an ordinary session, so the gates above read it like any
+other and a dev session authorizes on the roles it logged in with. Sign in with
+a low-privilege role and you are held to it, which is how you see what such a
+role sees.
 
 Ungated by design: `GET /health`, `GET /auth/config`, the OIDC and
 device-authorization routes (they mint the session), and `POST /auth/logout`,
@@ -391,23 +400,48 @@ Two exceptions to "session or nothing":
 - `POST /api/ingest/decision` is the proxy's audit-ingest path. It checks
   `X-PM-Ingest-Token` against `PM_SECRET_TOKEN` — and when that env is unset the
   gate is open to any caller, which is dev-only.
-- `GET /api/datasources` is the one `/api/**` route that also accepts
+- The read-only datasource routes (`GET /api/datasources` and the per-datasource
+  `{id}`, `{id}/catalog`, `{id}/wire-cert`, `{id}/table-detail`) also accept
   `Authorization: Bearer <wire token>` (`requireApiOrBearer`, private to
   `Datasources.kt`), because `pmon` must discover datasources without a browser
   cookie. Only the native-wire kinds `SESSION` and `USER` are accepted; `EDITOR`
   and `APPROVER_EXEC` are rejected, and a deactivated principal's surviving
   token fails closed. Roles are still resolved server-side, so this is an extra
-  authentication surface, not a privilege grant, and it is wired into this one
-  read-only route: a leaked wire token cannot mutate a datasource or mint
-  another credential over HTTP.
+  authentication surface, not a privilege grant, and it is wired into read-only
+  routes only: a leaked wire token cannot mutate a datasource or mint another
+  credential over HTTP.
 
 `GET /api/datasources?connectable=true` narrows the list to datasources the
 caller may `datasource.connect` to — the same name-keyed Cedar decision, with
 derived context tags, the proxy runs on connect. The unfiltered default is
 deliberate: JIT-request compose must show datasources you cannot yet connect to,
-precisely so they can be requested. The catalog itself
-(`GET /api/datasources/{id}/catalog`) is connect-gated, returning
-`datasource.not_connectable` otherwise.
+precisely so they can be requested. Everything keyed to one datasource is
+connect-gated, returning `datasource.not_connectable` otherwise: the row itself
+(`{id}`, which carries the advertised address and certificate chain), its
+catalog, its wire certificate, and its live table detail. Reading a table's
+physical shape needs the same authority as querying it.
+
+The unfiltered list is the alternate path to those same bytes, so it redacts
+rather than filters: a row the caller cannot connect to keeps its identity
+(name, engine, tags) and loses its connection material — `host`, `port`,
+`dbName`, `advertiseAddr`, `advertiseCertChain`. Enough to name in an access
+request, not enough to dial. There is no admin exemption: a list row that
+answered more fully than `{id}` does would simply be a way around `{id}`.
+
+`admin.datasources` does **not** imply any of these reads. The seeded
+`system:admin` role carries the three `admin.*` actions and no
+`datasource.connect` — it is administrative, not a data reader — so on a stock
+install an admin who holds no connect grant gets `datasource.not_connectable`
+from all four per-datasource routes, `{id}/table-detail` included, and redacted
+rows from the list. That is deliberate: classification and policy work run off
+`{id}/catalog`, which has always required connect, and the console reaches
+`{id}/table-detail` only from the SQL editor's table browser. An operator who
+wants admins browsing live table metadata grants them a connect policy, the same
+one that lets them query it.
+
+A dev session decides here like any other: `POST /auth/debug` persists its
+claimed roles as real assignments, so Cedar evaluates them and the session reads
+exactly the connection material those roles grant.
 
 ## What this fixes (falls out of the model, not bolted on)
 

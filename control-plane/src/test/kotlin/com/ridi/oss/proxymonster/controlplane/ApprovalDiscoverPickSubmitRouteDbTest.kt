@@ -3,6 +3,8 @@ package com.ridi.oss.proxymonster.controlplane
 import com.ridi.oss.proxymonster.controlplane.authz.CedarPolicyInput
 import com.ridi.oss.proxymonster.controlplane.support.EnforcementFixture
 import com.ridi.oss.proxymonster.controlplane.support.requireDockerOrSkip
+import com.ridi.oss.proxymonster.controlplane.support.testLoginRoute
+import com.ridi.oss.proxymonster.controlplane.support.webSessionCookie
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation as ClientContentNegotiation
@@ -16,9 +18,7 @@ import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.install
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.routing.routing
-import io.ktor.server.sessions.SessionTransportTransformerMessageAuthentication
 import io.ktor.server.sessions.Sessions
-import io.ktor.server.sessions.cookie
 import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import kotlinx.serialization.json.Json
@@ -35,24 +35,26 @@ import kotlin.test.assertTrue
  * coverage, driven at the HTTP layer against a real introspected catalog + real Cedar grants
  * ([EnforcementFixture.postgres]).
  *
- * It also carries ROUTE-level teeth for the R-ALONE preview, in the case that actually distinguishes
- * it: `debug-user` here HOLDS an own role (`base-reader`, which runs `select id, ssn from users` with
- * `ssn` masked). Two candidates are seeded so the union and R-alone decisions genuinely diverge:
- *   * `full-reader` unmasks `ssn` ON ITS OWN → offered under both models (the positive round-trip pick);
- *   * `unmask-only` grants unmasked-`ssn` but NO datasource.connect/sql.select, so ALONE it DENYs, while
- *     `{base-reader, unmask-only}` would connect (via base-reader) and unmask `ssn`. A unioned
- *     preview would offer `unmask-only`; under R-alone it must NOT be — this test catches the union
- *     bug, unlike a no-own-roles fixture where `ownRoles + R == {R}` makes the two implementations equal.
- * The pure [RoleDiscoveryTest] covers the union-vs-alone logic directly; this pins the ROUTE wiring
- * (ownRoles resolution + per-candidate decideQuery through real Cedar) to the same behavior end to end.
+ * It also carries ROUTE-level teeth for the R-ALONE preview: each candidate is previewed under `{R}` ALONE
+ * (never unioned with any other role), on the `workflow-executor` channel. Three roles are seeded so a
+ * union would diverge from the R-alone decision the route makes:
+ *   * `base-reader` runs `select id, ssn from users` with `ssn` masked → offered, outcome MASK;
+ *   * `full-reader` unmasks `ssn` ON ITS OWN → offered, outcome ALLOW (the positive round-trip pick);
+ *   * `unmask-only` grants unmasked-`ssn` but NO datasource.connect/sql.select, so ALONE it DENYs and must
+ *     NOT be offered — a unioned preview `{base-reader, unmask-only}` would connect (via base-reader) and
+ *     wrongly offer it. That divergence is the R-alone teeth.
+ * The pure [RoleDiscoveryTest] covers the listing logic directly; this pins the ROUTE wiring — per-candidate
+ * `decideQuery` under `{R}` alone on `workflow-executor`, through real Cedar — to the same behavior end to end.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class ApprovalDiscoverPickSubmitRouteDbTest {
     private lateinit var fx: EnforcementFixture
     private lateinit var runExecService: RunExecService
+    private lateinit var sessionStore: PrincipalSessionStore
     private lateinit var config: Config
 
     private val sql = "select id, ssn from users"
+    private val requester = "dev@example.com"
 
     @BeforeAll
     fun setup() {
@@ -61,6 +63,7 @@ class ApprovalDiscoverPickSubmitRouteDbTest {
         // Never exercised by discover-roles or the proactive-compose POST /api/approvals — both routes
         // stop at decideQuery / accessStore.createQueryRequest, well short of runExecService.
         runExecService = RunExecService(ControlPlaneCore(fx.dataSource))
+        sessionStore = PrincipalSessionStore(fx.dataSource, null)
 
         // A datasource-scoped query-approval policy row (a global NULL-datasource row is already seeded
         // and unique, so this is scoped to fx.datasource — same shape as ApprovalExecuteRouteDbTest.setup
@@ -69,17 +72,15 @@ class ApprovalDiscoverPickSubmitRouteDbTest {
         // the request; discover-roles itself doesn't consult it, but the end-to-end submit step does.
         seedRolesForUnionVsAloneTeeth()
 
-        // authDebug=true: the requester is the literal `debug-user`, who (per seedRolesForUnionVsAloneTeeth)
-        // holds `base-reader` — so the baseline for `sql` is a genuine masked ALLOW, not a stubbed one.
         config = Config(
-            httpPort = 0, dbUrl = "", dbUser = "", dbPassword = "", authDebug = true, secretToken = null,
+            httpPort = 0, dbUrl = "", dbUser = "", dbPassword = "", authDebug = false, secretToken = null,
             sessionSecret = "discover-pick-submit-test-secret", oidc = null, resultKey = null, scimToken = null,
             sessionWindowSeconds = 3600, idpRecheckIntervalSeconds = 600, devMarker = true,
         )
     }
 
     /**
-     * Seed the own-role + two candidates whose union and R-alone previews diverge (see the class kdoc).
+     * Seed three roles whose R-alone previews diverge from a union preview (see the class kdoc).
      * Mirrors [EnforcementFixture.seedPolicy]'s pattern (the `users` Table EUID + connect/select + read
      * grants). [com.ridi.oss.proxymonster.controlplane.authz.CedarEngine] rebuilds its cached PolicySet on
      * the next stateVersion, so grants created here (before the first request) are live for the test.
@@ -92,9 +93,9 @@ class ApprovalDiscoverPickSubmitRouteDbTest {
         fun grant(name: String, src: String) =
             fx.cedarPolicyStore.create(CedarPolicyInput(name = name, cedarSrc = src), updatedBy = "discover-pick-submit-test")
 
-        // debug-user's OWN role: connects + selects, cleartext except pii, pii (ssn) masked → baseline MASK.
+        // base-reader: connects + selects, cleartext except pii, pii (ssn) masked → runs Q with ssn MASKed.
         val baseReader = fx.policyStore.createRole(RoleInput("base-reader"))
-        fx.policyStore.createAssignment(RoleAssignmentInput("debug-user", baseReader.id))
+        fx.policyStore.createAssignment(RoleAssignmentInput(requester, baseReader.id))
         grant("base-reader-connect-select", """permit(principal in Role::"base-reader", action in [Action::"datasource.connect", Action::"stmt.cat.read"], resource in Datasource::"${ds.name}");""")
         grant("base-reader-users-unmasked", """permit(principal in Role::"base-reader", action == Action::"result.read.unmasked", resource in Table::"$usersEuid") unless { resource in Tag::"pii" };""")
         grant("base-reader-users-masked-pii", """permit(principal in Role::"base-reader", action == Action::"result.read.masked", resource in Table::"$usersEuid") when { resource in Tag::"pii" };""")
@@ -111,10 +112,13 @@ class ApprovalDiscoverPickSubmitRouteDbTest {
         grant("unmask-only-users-unmasked", """permit(principal in Role::"unmask-only", action == Action::"result.read.unmasked", resource in Table::"$usersEuid");""")
     }
 
-    private fun ApplicationTestBuilder.wire(): HttpClient {
+    private suspend fun ApplicationTestBuilder.wire(): HttpClient {
         application {
+            attributes.put(PRINCIPAL_SESSION_STORE, sessionStore)
             install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true; encodeDefaults = true }) }
+            install(Sessions) { webSessionCookie(sessionStore, config.sessionSecret) }
             routing {
+                testLoginRoute(sessionStore, config)
                 approvalRoutes(
                     config, fx.accessStore, fx.auditStore, fx.datasourceStore, fx.policyStore,
                     fx.userGroupStore, null, fx.roleResolver,
@@ -122,11 +126,13 @@ class ApprovalDiscoverPickSubmitRouteDbTest {
                 )
             }
         }
-        return createClient {
+        val client = createClient {
             expectSuccess = false
             install(HttpCookies)
             install(ClientContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
         }
+        assertEquals(HttpStatusCode.NoContent, client.post("/test/session/$requester").status)
+        return client
     }
 
     @Test
@@ -139,10 +145,6 @@ class ApprovalDiscoverPickSubmitRouteDbTest {
         }
         assertEquals(HttpStatusCode.OK, discoverResponse.status)
         val discovered = discoverResponse.body<DiscoverRolesResponse>()
-        assertTrue(
-            discovered.baselineAllowed,
-            "debug-user holds base-reader, which runs the query with ssn masked -> the baseline is a masked ALLOW",
-        )
 
         val offered = discovered.options.map { it.roleName }.toSet()
         // The teeth: `unmask-only` alone can't even connect (DENY), so R-alone must not offer it. A
@@ -155,9 +157,9 @@ class ApprovalDiscoverPickSubmitRouteDbTest {
         val fullReader = discovered.options.singleOrNull { it.roleName == "full-reader" }
         assertTrue(
             fullReader != null,
-            "full-reader unmasks ssn ON ITS OWN, improving on the masked baseline -> it must be offered. Offered: $offered",
+            "full-reader runs the query and returns ssn cleartext ON ITS OWN -> it must be offered. Offered: $offered",
         )
-        assertEquals(listOf("ssn"), fullReader!!.unmasksColumns, "the offered role must report ssn as newly unmasked over the baseline")
+        assertEquals(Decision.ALLOW, fullReader!!.decision, "full-reader returns ssn cleartext, so its outcome is ALLOW")
 
         val submitResponse = client.post("/api/approvals") {
             contentType(ContentType.Application.Json)

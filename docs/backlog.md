@@ -8,13 +8,12 @@ forward work. MySQL leads PostgreSQL in priority.
 ## Deployment & operations
 
 - Explicit production mode: refuse startup when any debug bypass
-  (`PM_AUTH_DEBUG`, a committed session-secret fallback, an unset ingest token)
-  is enabled, instead of inferring production from a heuristic.
+  (`PM_AUTH_DEBUG`, a committed session-secret fallback) is enabled, instead of
+  inferring production from a heuristic.
 - Per-datasource authorization for posture. A proxy's `Register` currently
   overwrites a datasource's tags gated only by the shared proxy token; gate
-  posture mutation behind admin authz, forbid `Register` from overwriting an
-  existing datasource's posture, and fail startup when the proxy token is unset
-  in production.
+  posture mutation behind admin authz, and forbid `Register` from overwriting an
+  existing datasource's posture.
 - Multi-instance support. The system runs single-instance today. Before any
   rolling or multi-replica deploy: harden the `system:admin` bootstrap against a
   migrate-while-serving interleave (fleet-stopped migration, or
@@ -210,18 +209,12 @@ Fixes for gaps documented in
   (saved lineage), so an output-name match can no longer release stored
   cleartext under a mask plan computed for a different physical column. High
   priority.
-- Fail-closed close for a `search_path` change made inside Bind parameter
-  coercion: re-probe after `Bind`, or plan under a pinned `search_path`.
 - Fail-closed manifest-completeness guard: deny a touched system schema that has
   no governing manifest, plus a version-independent system-table floor (the
   analog of the dangerous-function floor), so completeness doesn't depend on
   grant hygiene.
 - Per-engine-version golden inventory of system objects plus a CI release-diff
   gate, so a manifest can't silently fall behind a new engine minor.
-- Route resource-bearing utility commands (e.g. `ANALYZE <table>`) through a
-  Cedar gate instead of blanket passthrough, closing the existence oracle.
-- Make the role-approval `Request` EUID request-unique so one approval can't
-  authorize a principal's later requests.
 - Canonicalize introspected schema names on the proxy side (case-fold-aware),
   removing the interim MySQL lowercase fold in the control plane.
 - Broker a per-user target DB login so `SET PASSWORD` / `SET GLOBAL` stop
@@ -267,12 +260,11 @@ Fixes for gaps documented in
   client through it. This adds integration confidence, not a missing enforcement
   assertion.
 - Backfill DB-backed regression tests for enforcement invariants whose code is
-  confirmed correct but only covered indirectly: an EXPLAIN carrying a masked
-  column denying, the editor's refusal of session-mutating and
-  transaction-control statements, the editor's fail-closed mask bind, and the
-  approval route's conflict and not-found cases. Also: that a deny under the
-  approval role stores no result, and that a group-member approver lacking a
-  role-scoped approve permission is refused at execute.
+  confirmed correct but only covered indirectly: the editor's refusal of
+  session-mutating and transaction-control statements, the editor's fail-closed
+  mask bind, and the approval route's conflict and not-found cases. Also: that a
+  deny under the approval role stores no result, and that a group-member
+  approver lacking a role-scoped approve permission is refused at execute.
 - Diagnostic-redaction corpus probe. A test that builds a corpus from each
   engine's full error-code catalog plus adversarial constraints, conversions,
   functions, and raised errors, replays it against every supported engine
@@ -319,9 +311,9 @@ Fixes for gaps documented in
 - Proxy-side cancel brokering: issue synthetic `TargetDbKeyData` and broker
   cancels proxy-side, so `CancelRequest` can require TLS without breaking psql's
   Ctrl-C.
-- Wire-cert rotation refresh: a rotated proxy leaf cert only re-advertises its
-  pinning fingerprint on the next reconnect resync. Push the new fingerprint on
-  rotation instead, so a pinning client is never left on a stale one.
+- Wire-cert rotation refresh: a rotated proxy leaf cert is only re-advertised on
+  the next reconnect resync. Push the new chain on rotation so a verifying
+  client is never left with stale trust material.
 - PostgreSQL brokering in `pmon`: the daemon fronts MySQL only, so PostgreSQL
   datasources are discovered but skipped and their connection strings are
   rendered without a broker behind them.
@@ -341,8 +333,8 @@ Fixes for gaps documented in
 - Push-based datasource discovery for `pmon`. Rediscovery polls every 30
   seconds, so a revoked datasource keeps its broker open for up to that long. A
   per-principal stream would cut revocation latency to sub-second and carry a
-  rotated certificate fingerprint; the poll stays the authoritative backstop,
-  since a dropped stream must never read as "no change". Waits on the pmon API
+  rotated certificate chain; the poll stays the authoritative backstop, since a
+  dropped stream must never read as "no change". Waits on the pmon API
   authentication decision — the existing event stream is cookie-authenticated
   and `pmon` holds no cookie.
 - Menu-bar app signing and distribution. The tray app is built and ad-hoc

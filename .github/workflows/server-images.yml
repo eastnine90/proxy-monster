@@ -90,11 +90,11 @@ jobs:
       SCOPE: ${{ matrix.image.name }}-${{ matrix.arch }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           # An organization access token, so the username is the org rather than a person's handle
           # and the credential outlives any individual's account.
@@ -103,7 +103,7 @@ jobs:
 
       # Pushed by digest with no tag: a tag naming one architecture would be visible to a puller
       # between here and the merge. Only the merge job makes a tag point at anything.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         id: build
         with:
           context: ${{ matrix.image.context }}
@@ -158,16 +158,16 @@ jobs:
       # This job runs even when a sibling image's build failed, so its own architectures may be
       # missing. continue-on-error keeps the download from being the thing that reports that: the
       # merge step names the missing architecture instead.
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           pattern: digest-${{ matrix.name }}-*
           path: /tmp/digests
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -178,7 +178,7 @@ jobs:
           aws-region: us-east-1
           role-to-assume: ${{ secrets.ECR_PUBLIC_ROLE_ARN }}
 
-      - uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
         id: ecr-public
         with:
           registry-type: public

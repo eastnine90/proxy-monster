@@ -182,8 +182,10 @@ var mysqlStatements = []mysqlStatement{
 	{"CREATE INDEX", "CREATE INDEX i ON users (id)", "stmt.kind.create_index", pb.StatementKind_STATEMENT_KIND_CREATE_INDEX},
 	{"CREATE VIEW", "CREATE VIEW v AS SELECT 1", "stmt.kind.create_view", pb.StatementKind_STATEMENT_KIND_CREATE_VIEW},
 	{"CREATE DATABASE", "CREATE DATABASE d", "stmt.kind.create_database", pb.StatementKind_STATEMENT_KIND_CREATE_DATABASE},
-	{"CREATE TRIGGER", "CREATE TRIGGER trg BEFORE INSERT ON users FOR EACH ROW SET @a = 1", "unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
-	{"CREATE PROCEDURE", "CREATE PROCEDURE p() SELECT 1", "unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
+	{"CREATE TRIGGER", "CREATE TRIGGER trg BEFORE INSERT ON users FOR EACH ROW SET @a = 1", "stmt.kind.create_trigger", pb.StatementKind_STATEMENT_KIND_CREATE_TRIGGER},
+	// The body is not analyzable (no lineage through a routine body), but the statement now CLASSIFIES:
+	// Cedar gates it as stmt.kind.create_procedure instead of an anonymous unknown.
+	{"CREATE PROCEDURE", "CREATE PROCEDURE p() SELECT 1", "stmt.kind.create_procedure + unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_CREATE_PROCEDURE},
 	{"CREATE FUNCTION (stored)", "CREATE FUNCTION f() RETURNS INT RETURN 1", "stmt.kind.create_function", pb.StatementKind_STATEMENT_KIND_CREATE_FUNCTION},
 	// A routine body carrying a query (RETURN (SELECT …)) is not a CTAS: the read happens at invocation,
 	// not at CREATE. Lineage cannot analyze the routine body, so it over-denies (unresolved) rather than
@@ -260,12 +262,15 @@ var mysqlStatements = []mysqlStatement{
 	{"RESET BINARY LOGS AND GTIDS", "RESET BINARY LOGS AND GTIDS", "INADMISSIBLE-deny", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN}, // 8.4 replacement for RESET MASTER
 
 	// ---- Account management (§15.7.1) — privileged, must fail closed ----
-	{"CREATE USER", "CREATE USER 'u'@'h'", "unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
-	{"ALTER USER", "ALTER USER 'u'@'h' IDENTIFIED BY 'p'", "unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
-	{"DROP USER", "DROP USER 'u'@'h'", "unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
+	{"CREATE USER", "CREATE USER 'u'@'h'", "stmt.kind.create_user", pb.StatementKind_STATEMENT_KIND_CREATE_USER},
+	{"CREATE USER RANDOM PASSWORD", "CREATE USER 'u'@'h' IDENTIFIED BY RANDOM PASSWORD", "stmt.kind.create_user", pb.StatementKind_STATEMENT_KIND_CREATE_USER},
+	{"ALTER USER", "ALTER USER 'u'@'h' IDENTIFIED BY 'p'", "stmt.kind.alter_user", pb.StatementKind_STATEMENT_KIND_ALTER_USER},
+	{"DROP USER", "DROP USER 'u'@'h'", "stmt.kind.drop_user", pb.StatementKind_STATEMENT_KIND_DROP_USER},
+	// RENAME USER is the one account-mgmt form sqlglot-go leaves as an opaque Command, so it stays
+	// unanalyzable where its CREATE/ALTER/DROP siblings resolve to a classified kind.
 	{"RENAME USER", "RENAME USER 'u'@'h' TO 'v'@'h'", "unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
-	{"CREATE ROLE", "CREATE ROLE 'r'", "unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
-	{"DROP ROLE", "DROP ROLE 'r'", "unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
+	{"CREATE ROLE", "CREATE ROLE 'r'", "stmt.kind.create_role", pb.StatementKind_STATEMENT_KIND_CREATE_ROLE},
+	{"DROP ROLE", "DROP ROLE 'r'", "stmt.kind.drop_role", pb.StatementKind_STATEMENT_KIND_DROP_ROLE},
 	{"GRANT (priv)", "GRANT SELECT ON *.* TO 'u'@'h'", "stmt.kind.grant_priv + unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_GRANT_PRIV},
 	{"GRANT (role)", "GRANT 'r' TO 'u'@'h'", "stmt.kind.grant_priv + unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_GRANT_PRIV},
 	{"REVOKE (priv)", "REVOKE SELECT ON *.* FROM 'u'@'h'", "stmt.kind.revoke_priv + unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_REVOKE_PRIV},
@@ -275,8 +280,8 @@ var mysqlStatements = []mysqlStatement{
 	{"SET DEFAULT ROLE", "SET DEFAULT ROLE 'r' TO 'u'@'h'", "stmt.kind.set_default_role + utility:SET_DEFAULT_ROLE", pb.StatementKind_STATEMENT_KIND_SET_DEFAULT_ROLE},
 
 	// ---- Table maintenance (§15.7.3) ----
-	// GAP: ANALYZE is in the session-passthrough set (facts.go), so it is connect-only; CHECK/OPTIMIZE/REPAIR fail closed.
-	{"ANALYZE TABLE", "ANALYZE TABLE users", "stmt.kind.analyze_table", pb.StatementKind_STATEMENT_KIND_ANALYZE_TABLE},
+	// ANALYZE gates the target table's read (facts.go), so it is not connect-only; CHECK/OPTIMIZE/REPAIR fail closed.
+	{"ANALYZE TABLE", "ANALYZE TABLE users", "result.read + stmt.kind.analyze_table", pb.StatementKind_STATEMENT_KIND_ANALYZE_TABLE},
 	{"CHECK TABLE", "CHECK TABLE users", "unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},       // parse error
 	{"CHECKSUM TABLE", "CHECKSUM TABLE users", "unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN}, // parse error
 	{"OPTIMIZE TABLE", "OPTIMIZE TABLE users", "stmt.kind.optimize_table + unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_OPTIMIZE_TABLE},
@@ -345,8 +350,12 @@ var mysqlStatements = []mysqlStatement{
 	// ---- SHOW: data/credential/topology-exposing — must be a utility or fail closed ----
 	// The `metadata`-only rows here are UNDER-GATED today (see knownConnectOnlyGaps): the analyzer emits no
 	// utility for them, so they relay connect-only on wire. The statement-typing redesign closes them.
-	{"SHOW PROCESSLIST", "SHOW PROCESSLIST", "stmt.kind.show_processlist + utility:SHOW_PROCESSLIST", pb.StatementKind_STATEMENT_KIND_SHOW_PROCESSLIST},
-	{"SHOW GRANTS", "SHOW GRANTS", "stmt.kind.show_grants + utility:SHOW_GRANTS", pb.StatementKind_STATEMENT_KIND_SHOW_GRANTS},
+	{"SHOW PROCESSLIST", "SHOW PROCESSLIST", "stmt.kind.show_processlist", pb.StatementKind_STATEMENT_KIND_SHOW_PROCESSLIST},
+	{"SHOW GRANTS", "SHOW GRANTS", "stmt.kind.show_grants", pb.StatementKind_STATEMENT_KIND_SHOW_GRANTS},
+	{"SHOW GRANTS FOR user@host", "SHOW GRANTS FOR 'store'@'172.27.0.0/255.255.0.0'", "stmt.kind.show_grants", pb.StatementKind_STATEMENT_KIND_SHOW_GRANTS},
+	{"SHOW GRANTS FOR CURRENT_USER()", "SHOW GRANTS FOR CURRENT_USER()", "stmt.kind.show_grants", pb.StatementKind_STATEMENT_KIND_SHOW_GRANTS},
+	{"SHOW GRANTS USING role", "SHOW GRANTS FOR 'store'@'localhost' USING 'r1', 'r2'", "stmt.kind.show_grants", pb.StatementKind_STATEMENT_KIND_SHOW_GRANTS},
+	{"SHOW GRANTS detached host", "SHOW GRANTS FOR 'store'@ 'localhost'", "unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_STMT_UNKNOWN},
 	{"SHOW CREATE USER", "SHOW CREATE USER CURRENT_USER", "stmt.kind.show_create_user + utility:SHOW_CREATE_USER", pb.StatementKind_STATEMENT_KIND_SHOW_CREATE_USER},
 	{"SHOW ENGINE INNODB STATUS", "SHOW ENGINE INNODB STATUS", "stmt.kind.show_engine_status + utility:SHOW_ENGINE_STATUS", pb.StatementKind_STATEMENT_KIND_SHOW_ENGINE_STATUS},
 	{"SHOW BINLOG EVENTS", "SHOW BINLOG EVENTS", "stmt.kind.show_binlog_events + utility:SHOW_BINLOG_EVENTS", pb.StatementKind_STATEMENT_KIND_SHOW_BINLOG_EVENTS},
@@ -363,8 +372,8 @@ var mysqlStatements = []mysqlStatement{
 	// ---- Utility (§15.8) ----
 	{"DESCRIBE", "DESCRIBE users", "stmt.kind.describe", pb.StatementKind_STATEMENT_KIND_DESCRIBE},
 	{"DESC", "DESC users", "stmt.kind.describe", pb.StatementKind_STATEMENT_KIND_DESCRIBE},
-	{"EXPLAIN (query)", "EXPLAIN SELECT id FROM users", "result.read + stmt.kind.select", pb.StatementKind_STATEMENT_KIND_SELECT},
-	{"EXPLAIN ANALYZE", "EXPLAIN ANALYZE SELECT id FROM users", "result.read + stmt.kind.select", pb.StatementKind_STATEMENT_KIND_SELECT},
+	{"EXPLAIN (query)", "EXPLAIN SELECT id FROM users", "result.read + stmt.kind.explain", pb.StatementKind_STATEMENT_KIND_EXPLAIN},
+	{"EXPLAIN ANALYZE", "EXPLAIN ANALYZE SELECT id FROM users", "result.read + stmt.kind.explain", pb.StatementKind_STATEMENT_KIND_EXPLAIN},
 	{"EXPLAIN (table)", "EXPLAIN users", "stmt.kind.describe", pb.StatementKind_STATEMENT_KIND_DESCRIBE}, // EXPLAIN <table> is AST-identical to DESCRIBE <table>
 	{"HELP", "HELP 'contents'", "stmt.kind.help + unanalyzable→exception.unanalyzable", pb.StatementKind_STATEMENT_KIND_HELP},
 	{"USE", "USE acme", "stmt.kind.use", pb.StatementKind_STATEMENT_KIND_USE},
@@ -422,7 +431,7 @@ var privilegedNeedingGate = map[string]bool{
 	"RESET REPLICA": true, "RESET SLAVE": true, "RESET MASTER": true, "RESET BINARY LOGS AND GTIDS": true,
 	"START GROUP_REPLICATION": true, "STOP GROUP_REPLICATION": true, "PURGE BINARY LOGS": true,
 	"CHANGE REPLICATION SOURCE TO": true, "CHANGE MASTER TO": true, "CHANGE REPLICATION FILTER": true,
-	"CREATE USER": true, "ALTER USER": true, "DROP USER": true, "RENAME USER": true, "CREATE ROLE": true,
+	"CREATE USER": true, "CREATE USER RANDOM PASSWORD": true, "ALTER USER": true, "DROP USER": true, "RENAME USER": true, "CREATE ROLE": true,
 	"DROP ROLE": true, "GRANT (priv)": true, "GRANT (role)": true, "REVOKE (priv)": true, "REVOKE (role)": true,
 	"ANALYZE TABLE": true, "CHECK TABLE": true, "CHECKSUM TABLE": true, "OPTIMIZE TABLE": true, "REPAIR TABLE": true,
 	"INSTALL PLUGIN": true, "UNINSTALL PLUGIN": true, "INSTALL COMPONENT": true, "UNINSTALL COMPONENT": true,
@@ -437,6 +446,7 @@ var privilegedNeedingGate = map[string]bool{
 	"SET PASSWORD": true, "SET ROLE": true, "SET DEFAULT ROLE": true, "SET GLOBAL var": true,
 	"SET PERSIST var": true, "SET PERSIST_ONLY var": true, "SET sql_log_bin": true,
 	"SHOW PROCESSLIST": true, "SHOW GRANTS": true, "SHOW CREATE USER": true, "SHOW ENGINE INNODB STATUS": true,
+	"SHOW GRANTS FOR user@host": true, "SHOW GRANTS FOR CURRENT_USER()": true, "SHOW GRANTS USING role": true,
 	"SHOW BINLOG EVENTS": true, "SHOW RELAYLOG EVENTS": true, "SHOW REPLICA STATUS": true, "SHOW SLAVE STATUS": true,
 	"SHOW BINARY LOGS": true, "SHOW MASTER STATUS": true, "SHOW REPLICAS": true, "SHOW SLAVE HOSTS": true,
 }
@@ -447,12 +457,10 @@ var privilegedNeedingGate = map[string]bool{
 // documented as an open boundary in docs/system-classification.md and are closed by the statement-typing
 // redesign (docs/statement-typing.md), which removes the benign catch-all passthrough they fall into.
 //
-//	ANALYZE TABLE                       — in the analyzer's SESSION passthrough set (facts.go).
 //	SET sql_log_bin                     — restricted SESSION variable; SET is gated by scope/PASSWORD only.
 //	SHOW MASTER STATUS / SHOW BINARY LOGS / SHOW REPLICAS / SHOW SLAVE HOSTS
 //	                                    — replication topology/binlog reads the analyzer emits no utility for.
 var knownConnectOnlyGaps = map[string]bool{
-	"ANALYZE TABLE":      true,
 	"SET sql_log_bin":    true,
 	"SHOW MASTER STATUS": true,
 	"SHOW BINARY LOGS":   true,
@@ -460,10 +468,27 @@ var knownConnectOnlyGaps = map[string]bool{
 	"SHOW SLAVE HOSTS":   true,
 }
 
+// gatedBareKinds are privileged kinds whose bare stmt.kind.<k> term IS the gate, not an under-gating.
+// Account management (CREATE/ALTER/DROP USER|ROLE) touches no data, so it emits no utility grant and no
+// lineage — a lone stmt.kind.<k>. But the CP schema maps these kinds into stmt.cat.admin.account, a
+// deny-by-default category with no benign passthrough, so a bare admin-category term denies unless an
+// admin grant is present. This is the opposite of knownConnectOnlyGaps, which are genuinely under-gated
+// (a benign category). The map key is the resolve() output.
+var gatedBareKinds = map[string]bool{
+	"stmt.kind.create_user":      true,
+	"stmt.kind.alter_user":       true,
+	"stmt.kind.drop_user":        true,
+	"stmt.kind.create_role":      true,
+	"stmt.kind.drop_role":        true,
+	"stmt.kind.show_grants":      true,
+	"stmt.kind.show_processlist": true,
+}
+
 // TestPrivilegedStatementsAreGated is the security invariant: every privileged or data-exposing MySQL
-// statement must be gated — a datasource verb, a utility grant, or a fail-closed deny — never a bare
-// connect-only passthrough. The known gaps are enumerated, so this stays green today AND fails the moment a
-// new privileged kind falls through the analyzer's dispatch to a bare stmt.kind passthrough.
+// statement must be gated — a datasource verb, a utility grant, a gated-category kind, or a fail-closed
+// deny — never a bare connect-only passthrough. The known gaps are enumerated, so this stays green today
+// AND fails the moment a new privileged kind falls through the analyzer's dispatch to a bare stmt.kind
+// passthrough.
 func TestPrivilegedStatementsAreGated(t *testing.T) {
 	for _, s := range mysqlStatements {
 		if !privilegedNeedingGate[s.name] {
@@ -473,9 +498,10 @@ func TestPrivilegedStatementsAreGated(t *testing.T) {
 		// A bare connect-only passthrough now shows as a lone stmt.kind.<k> term (or the zero-grant
 		// sentinel): resolved, asking nothing beyond the kind — no utility grant, no result.read, and not
 		// a fail-closed deny. A privileged statement landing there is authorized by its benign-category
-		// kind alone, the same under-gating the METADATA/SESSION passthrough classes used to represent.
+		// kind alone, the same under-gating the METADATA/SESSION passthrough classes used to represent —
+		// UNLESS the kind's own category gates it (gatedBareKinds), which the account-mgmt kinds do.
 		bareKind := strings.HasPrefix(got, "stmt.kind.") && !strings.Contains(got, " + ")
-		connectOnly := bareKind || got == "allow(connect-only)"
+		connectOnly := (bareKind && !gatedBareKinds[got]) || got == "allow(connect-only)"
 		if connectOnly && !knownConnectOnlyGaps[s.name] {
 			t.Errorf("%s is privileged but resolves connect-only (%s) — it must be gated; verify %q", s.name, got, s.sql)
 		}

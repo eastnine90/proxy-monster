@@ -4,7 +4,6 @@ import com.ridi.oss.proxymonster.controlplane.authz.Authz
 import com.ridi.oss.proxymonster.controlplane.authz.AuthzAction
 import com.ridi.oss.proxymonster.controlplane.authz.AuthzContext
 import com.ridi.oss.proxymonster.controlplane.authz.AuthzDecision
-import com.ridi.oss.proxymonster.controlplane.authz.AuthzResource
 import com.ridi.oss.proxymonster.controlplane.authz.ColumnRef
 import com.ridi.oss.proxymonster.controlplane.authz.ColumnVerdict
 import com.ridi.oss.proxymonster.controlplane.authz.FunctionRef
@@ -25,13 +24,17 @@ import com.ridi.oss.proxymonster.classification.BaselineDangerousFunctions
 import com.ridi.oss.proxymonster.grpc.ColumnMask
 import com.ridi.oss.proxymonster.grpc.EnfAction
 import com.ridi.oss.proxymonster.grpc.Engine
+import com.ridi.oss.proxymonster.grpc.RunError
 import com.ridi.oss.proxymonster.grpc.columnMask
 import com.ridi.oss.proxymonster.analyzer.pb.ColumnSpec
 import com.ridi.oss.proxymonster.analyzer.pb.FailureClass
 import com.ridi.oss.proxymonster.analyzer.pb.MaskedDisposition
+import com.ridi.oss.proxymonster.analyzer.pb.RequireResultReadGrant
+import com.ridi.oss.proxymonster.analyzer.pb.ResultFingerprint
 import com.ridi.oss.proxymonster.analyzer.pb.StatementFacts
 import com.ridi.oss.proxymonster.analyzer.pb.StatementKind
 import com.ridi.oss.proxymonster.analyzer.pb.columnSpec
+import com.ridi.oss.proxymonster.analyzer.pb.resultFingerprint
 import com.ridi.oss.proxymonster.analyzer.pb.engineConfig as pbEngineConfig
 import com.ridi.oss.proxymonster.analyzer.pb.namespace as pbNamespace
 import com.ridi.oss.proxymonster.analyzer.pb.relationIdentity
@@ -103,6 +106,10 @@ data class QueryResponse(
     val columns: List<String> = emptyList(),
     val rows: List<List<String?>> = emptyList(),
     val rowsAffected: Int? = null,
+    // The executed decision's requirements ([ResultFingerprint]), frozen with the stored result so a later
+    // view can deny drift ([decideResultView]). Carried back from the Decide handler on the RunDecision.
+    @Serializable(with = ResultFingerprintSerializer::class)
+    val resultFingerprint: ResultFingerprint = ResultFingerprint.getDefaultInstance(),
     val latencyMs: Long = 0,
 )
 
@@ -132,6 +139,24 @@ enum class Channel(val contextValue: String) {
     MCP("mcp"),
 }
 
+/** The analyzer's result-read grants bundled as the [ResultFingerprint] message [decideResultView] freezes
+ *  with a stored result and compares (by the message's own structural equality). */
+internal fun fingerprintOf(requirements: List<RequireResultReadGrant>): ResultFingerprint =
+    resultFingerprint { grants.addAll(requirements) }
+
+/**
+ * kotlinx serializer for [ResultFingerprint]: a `@Serializable` payload ([QueryResponse], [DecryptedResult])
+ * holds the proto MESSAGE itself, persisted as base64 of its proto bytes. kotlinx can't serialize a protobuf
+ * message directly, so this delegates to proto's own serialization rather than exposing a raw ByteArray field.
+ */
+object ResultFingerprintSerializer : KSerializer<ResultFingerprint> {
+    override val descriptor = PrimitiveSerialDescriptor("ResultFingerprint", PrimitiveKind.STRING)
+    override fun serialize(encoder: Encoder, value: ResultFingerprint) =
+        encoder.encodeString(java.util.Base64.getEncoder().encodeToString(value.toByteArray()))
+    override fun deserialize(decoder: Decoder): ResultFingerprint =
+        ResultFingerprint.parseFrom(java.util.Base64.getDecoder().decode(decoder.decodeString()))
+}
+
 /** The verdict for a statement, without executing it: action + masks (output col → kind) + context. */
 data class DecisionContext(
     val action: EnfAction,
@@ -148,10 +173,15 @@ data class DecisionContext(
      * so target-DB column order matches the mask ordinals. Null = send verbatim. */
     val rewrittenSql: String? = null,
     /** The analyzer's ordered output column names for this decision (an empty list for a passthrough /
-     * unanalyzed statement). APPROVAL live result viewing compares this against the stored execute-enforced
-     * result to detect catalog drift between execute and view (a `SELECT *` re-expansion that would slide a
-     * mask onto the wrong stored column and leak a value) — a mismatch is DENY. */
+     * unanalyzed statement). */
     val outputColumns: List<String> = emptyList(),
+    /** The decision's authorization requirements — the analyzer's result-read grants (empty for a
+     * passthrough / unanalyzed statement). Carried structured to the proxy and back; an execute-under-R
+     * result freezes them ([fingerprintOf]) and the view denies if the live re-decision's differ.
+     * E.g. a column reorder moves `ssn` from ordinal 1 to 0, so the frozen grant (ssn MASK_OUTPUT @1) no
+     * longer matches the live one (@0) and the re-decided mask can't bind to the wrong stored column and
+     * leak it. See [decideResultView]. */
+    val resultFingerprint: List<RequireResultReadGrant> = emptyList(),
     /** The derived `context.tags` this decision was evaluated under, surfaced so [decisionRecord]
      * logs which tags the request earned. Stamped on EVERY decision that runs after context derivation —
      * ALLOW, MASK, DENY (structural + policy), and passthrough alike — so an audit row carries the attested
@@ -162,10 +192,8 @@ data class DecisionContext(
     /** MASK-only capability grant. A proxy may relay an unmaskable binary result unmasked iff this is true
      * AND the proxy's local feature capability says that relay path is supported. */
     val unmaskablePermitted: Boolean = false,
-    /** Whether the proxy must strip this statement's target-DB diagnostics to code + severity — set
-     * when the principal is not a full-cleartext reader of this datasource AND the diagnostic could carry a
-     * protected value (engine leaks on ALLOW, or the verdict touches protected data). See redactsDiagnostics
-     * and docs/diagnostic-redaction.md. */
+    /** Whether the proxy must strip this statement's target-DB diagnostics to code + severity: a MASK
+     * verdict, or an ALLOW whose viewer can't read every leak column unmasked (docs/diagnostic-redaction.md). */
     val sanitizeDiagnostics: Boolean = false,
     /** True when a successful statement may change persistent catalog structure. */
     val catalogChanging: Boolean = false,
@@ -178,29 +206,39 @@ data class DecisionContext(
 )
 
 /**
- * Whether a decision's target-DB diagnostics must be stripped to code + severity. Redact iff the
- * diagnostic could carry a protected value — the verdict touches protected data (MASK/DENY), or the engine
- * leaks even on an ALLOW ([leaksDiagnosticsOnAllow]) — AND the principal is NOT a full-cleartext reader
- * of the datasource ([mayReadUnmasked], the Cedar `result.read.unmasked`-on-datasource authorization: ALLOW
- * on a `system:development` preset via the -200 policy, or a datasource-wide unmasked grant). A full-cleartext
- * reader is someone no diagnostic can leak a protected value to. Keyed on Cedar authz + engine capability,
- * NEVER a datasource-tag check. [mayReadUnmasked] is a thunk so the Cedar call is skipped when the diagnostic
- * cannot carry a protected value anyway. See docs/diagnostic-redaction.md.
+ * Whether [principal] reads unmasked every column in the analyzer's diagnostic leak set ([leakColumns]);
+ * empty ⇒ true. A leak column missing from the catalog denies, and stmt_kind is stripped so a
+ * kind-conditional grant cannot qualify. See docs/diagnostic-redaction.md.
  */
-internal fun redactsDiagnostics(engine: Engine, action: EnfAction, mayReadUnmasked: () -> Boolean): Boolean {
-    if (!engine.leaksDiagnosticsOnAllow && action == EnfAction.ALLOW) return false
-    return !mayReadUnmasked()
+internal fun readsAllUnmasked(
+    principal: String,
+    roles: Set<String>,
+    ds: Datasource,
+    catalog: List<CatalogColumn>,
+    leakColumns: List<com.ridi.oss.proxymonster.analyzer.pb.ColumnResource>,
+    context: AuthzContext,
+    authz: Authz,
+    systemClassification: SystemClassificationService?,
+): Boolean {
+    if (leakColumns.isEmpty()) return true
+    val byKey = catalog.associateBy { listOf(it.catalog, it.schema, it.table, it.column) }
+    val refs = leakColumns.map { col ->
+        val row = byKey[listOf(col.catalog, col.identity.schema, col.identity.table, col.identity.column)] ?: return false
+        ColumnRef(
+            "${row.catalog}.${row.schema}.${row.table}.${row.column}",
+            row.catalog, row.schema, row.table, row.column, row.classification?.tags ?: emptyList(),
+        )
+    }
+    // Same system-tag attachment as the main column authz — a leak column of pg_authid must keep
+    // system:critical, or a datasource-wide unmasked grant would release its failing-row dump raw.
+    val systemTags = systemClassification?.let { sc ->
+        refs.map { Triple(it.catalog, it.schema, it.table) }.distinct().mapNotNull { (cat, schema, table) ->
+            sc.tagForTable(ds.engine, ds.engineVersion, cat, schema, table)?.let { Triple(cat, schema, table) to it }
+        }.toMap()
+    } ?: emptyMap()
+    return authz.authorizeColumns(principal, roles, ds.name, refs, context.copy(stmtKind = null), systemTags, ds.tags)
+        .values.all { it == ColumnVerdict.UNMASKED }
 }
-
-/**
- * Whether a datasource engine can leak a protected value through a diagnostic even for an ALLOW query — an
- * error revealing data the statement never referenced. PostgreSQL can (the whole-row `DETAIL: Failing row
- * contains (…)`); MySQL cannot (it echoes only the operated-on value, and any value-exposing read of a
- * protected column is denied). The one place this engine fact lives; the redaction logic branches on the
- * capability, never the engine name.
- */
-internal val Engine.leaksDiagnosticsOnAllow: Boolean
-    get() = this == Engine.POSTGRES
 
 /**
  * Pure union of a principal's role sources: the base set (direct `principal_role`) ∪ active JIT grant
@@ -355,8 +393,9 @@ internal fun effectiveAuthzContext(
     roles: Set<String>,
     datasource: String,
     datasourceTags: List<String>,
+    stmtKind: String? = null,
 ): AuthzContext {
-    val raw = caller.copy(channel = channel.contextValue)
+    val raw = caller.copy(channel = channel.contextValue, stmtKind = stmtKind)
     return raw.copy(tags = authz.resolveContextTags(principal, roles, datasource, raw, datasourceTags))
 }
 
@@ -443,8 +482,24 @@ fun decideQuery(
     // own roles). Ordinary resolution is already deleted-role-filtered in RoleResolver.
     val roles = providedRoles?.let { policyStore.liveRoleNames(it) } ?: roleResolver.resolve(principal)
     val roleList = roles.toList()
+    // The statement's classified kind, resolved before the context so a read policy can condition on it
+    // (`context.stmt_kind`) — e.g. permit unmasked reads only under a plan-only EXPLAIN, which returns no
+    // rows. STMT_UNKNOWN (a pre-parse failure), like an unspecified/unrecognized kind, leaves stmt_kind
+    // ABSENT rather than exposing a value to condition on; it routes through exception.unanalyzable at the
+    // kind gate below.
+    val statementKind = if (facts.hasStatementExec()) facts.statementExec.statementKind
+    else StatementKind.STATEMENT_KIND_STMT_UNKNOWN
     @Suppress("NAME_SHADOWING")
-    val context = effectiveAuthzContext(context, channel, authz, principal, roles, ds.name, ds.tags)
+    val context = effectiveAuthzContext(
+        context, channel, authz, principal, roles, ds.name, ds.tags,
+        stmtKind = statementKind
+            .takeIf {
+                it != StatementKind.STATEMENT_KIND_UNSPECIFIED &&
+                    it != StatementKind.STATEMENT_KIND_STMT_UNKNOWN &&
+                    it != StatementKind.UNRECOGNIZED
+            }
+            ?.name?.removePrefix("STATEMENT_KIND_")?.lowercase(),
+    )
     val derivedTags = context.tags.toList()
 
     // Fail-closed contract validation (analyzer.proto): the single statement-execution grant is the sole
@@ -534,8 +589,6 @@ fun decideQuery(
     // connect-only gaps (ANALYZE TABLE, SHOW MASTER STATUS, …). A missing grant (a pre-parse failure) reads
     // as STMT_UNKNOWN → exception.unanalyzable. Runs after connect/utility, before the passthrough allow; the
     // unanalyzable/utility gates still apply on top (e.g. ALTER TABLE stays prod-denied).
-    val statementKind = if (facts.hasStatementExec()) facts.statementExec.statementKind
-    else StatementKind.STATEMENT_KIND_STMT_UNKNOWN
     val kindAction = statementKindActionId(statementKind)
         ?: return structuralDeny("statement kind is unspecified", roleList, contextTags = derivedTags)
     if (authz.authorizeDatasourceActionId(principal, roles, kindAction, ds.name, context, ds.tags) !is AuthzDecision.Allow) {
@@ -553,19 +606,11 @@ fun decideQuery(
         facts.functionsList.isEmpty() &&
         facts.resultReadsList.none { it.hasColumn() || it.hasTable() || it.hasFunction() }
     ) {
-        // A no-column relay is still an ALLOW, and a literal DML write reaches here — UPDATE/DELETE/INSERT
-        // VALUES gate on their kind, not a column grant. On an engine that echoes the whole row on a
-        // constraint error (PostgreSQL's `DETAIL: Failing row contains (…)`) that write's error must still
-        // be redacted for a principal without unmasked read, so sanitizeDiagnostics is computed here too. It
-        // defaults false, and a metadata/session statement simply has no such DETAIL to strip.
-        val sanitizeDiagnostics = redactsDiagnostics(ds.engine, EnfAction.ALLOW) {
-            authz.authorizeDatasourceAction(
-                principal, roles, AuthzAction.RESULT_READ_UNMASKED, ds.name, context, ds.tags,
-            ) is AuthzDecision.Allow
-        }
+        // A literal write reaches this relay too, and its diagnostic can leak (a PostgreSQL constraint ERR
+        // dumps the whole target row) — gate on the analyzer's leak set. `SELECT 1` has an empty set: raw.
         return passthroughAllow(roleList, "passthrough (no data touched)", derivedTags)
             .copy(
-                sanitizeDiagnostics = sanitizeDiagnostics,
+                sanitizeDiagnostics = !readsAllUnmasked(principal, roles, ds, catalog, facts.diagnosticLeakColumnsList, context, authz, systemClassification),
                 schemaCandidates = facts.schemaQualifierCandidatesList.toSet(),
             )
             .withAnalyzerRewrite(facts)
@@ -603,6 +648,11 @@ fun decideQuery(
                 contextTags = derivedTags,
                 catalogChanging = facts.catalogChanging || facts.functionsList.isNotEmpty(),
                 schemaCandidates = facts.schemaQualifierCandidatesList.toSet(),
+                // A statement may be unresolvable only because this connection never fetched the schema it
+                // names, so refetch the qualifiers before relaying it unmasked.
+                catalogMiss = true,
+                // Unanalyzable: no leak set to authorize, so fail closed and redact the diagnostic.
+                sanitizeDiagnostics = true,
             )
             is AuthzDecision.Deny -> deny(reason, catalogMiss = true)
         }
@@ -647,6 +697,8 @@ fun decideQuery(
                 catalogChanging = facts.catalogChanging || facts.functionsList.isNotEmpty(),
                 catalogMiss = true,
                 schemaCandidates = facts.schemaQualifierCandidatesList.toSet(),
+                // An uncovered column means the leak set can't be authorized — fail closed and redact.
+                sanitizeDiagnostics = true,
             )
             is AuthzDecision.Deny -> structuralDeny(
                 coverage.reason, roleList, failedStage = "catalog", contextTags = derivedTags,
@@ -664,13 +716,13 @@ fun decideQuery(
         val row = catalogIndex.rowsByKey.getValue(key)
         ColumnRef(key, row.catalog, row.schema, row.table, row.column, row.classification?.tags ?: emptyList())
     }
-    val allTableIds = buildSet {
+    val touchedTableIds = buildSet {
         columnRefs.mapTo(this) { Triple(it.catalog, it.schema, it.table) }
         facts.sourcesList.mapTo(this) { Triple(it.catalog, it.schema, it.table) }
         facts.resultReadsList.filter { it.hasTable() }.mapTo(this) { Triple(it.table.catalog, it.table.schema, it.table.table) }
     }
     val systemTags = systemClassification?.let { sc ->
-        allTableIds.mapNotNull { (cat, schema, table) ->
+        touchedTableIds.mapNotNull { (cat, schema, table) ->
             sc.tagForTable(ds.engine, ds.engineVersion, cat, schema, table)?.let { Triple(cat, schema, table) to it }
         }.toMap()
     } ?: emptyMap()
@@ -754,9 +806,6 @@ fun decideQuery(
     }
 
     val action = if (masks.isEmpty()) EnfAction.ALLOW else EnfAction.MASK
-    if (facts.explainOfQuery && action == EnfAction.MASK) {
-        return structuralDeny(EXPLAIN_MASK_DENY, roleList, failedStage = "explain-masked", contextTags = derivedTags)
-    }
     // Every classified column the statement touched, whatever its tags are named: `pii` is a deployment's
     // own tag, so keying this on that one string leaves auditmon's mass-export detector blind on a
     // deployment that classifies with `pci`.
@@ -772,11 +821,10 @@ fun decideQuery(
     val unmaskablePermitted = action == EnfAction.MASK && authz.authorizeDatasourceAction(
         principal, roles, AuthzAction.EXCEPTION_UNMASKABLE, ds.name, context, ds.tags,
     ) is AuthzDecision.Allow
-    val sanitizeDiagnostics = redactsDiagnostics(ds.engine, action) {
-        authz.authorizeDatasourceAction(
-            principal, roles, AuthzAction.RESULT_READ_UNMASKED, ds.name, context, ds.tags,
-        ) is AuthzDecision.Allow
-    }
+    // MASK/DENY always redacts; an ALLOW redacts iff the analyzer's leak set holds a column the viewer
+    // can't read unmasked. `select id from users` (all readable) relays raw.
+    val sanitizeDiagnostics = action != EnfAction.ALLOW ||
+        !readsAllUnmasked(principal, roles, ds, catalog, facts.diagnosticLeakColumnsList, context, authz, systemClassification)
     return DecisionContext(
         action = action,
         denyReason = null,
@@ -787,6 +835,7 @@ fun decideQuery(
         detail = facts.detail,
         passthrough = false,
         outputColumns = facts.outputColumnsList,
+        resultFingerprint = facts.resultReadsList,
         contextTags = derivedTags,
         unmaskablePermitted = unmaskablePermitted,
         sanitizeDiagnostics = sanitizeDiagnostics,
@@ -804,8 +853,6 @@ private val MALFORMED_DISPOSITIONS = setOf(
 )
 
 internal const val MASK_BIND_DENY = "required mask could not be bound to a result column"
-private const val EXPLAIN_MASK_DENY =
-    "cannot EXPLAIN a query whose columns are masked — request full access or run the query directly"
 private const val SYSTEM_FUNCTION_DENY = "dangerous system function is not allowed:"
 private const val SYSTEM_UTILITY_DENY = "utility command is not allowed on this datasource:"
 private const val DEACTIVATED_PRINCIPAL_DENY = "principal is deprovisioned (deactivated) — access denied"
@@ -871,11 +918,11 @@ internal fun wireTaskForbiddenDeny(
 // Relay the analyzer's optional rewritten SQL on a decision we allow. rewrittenSql is Go-analyzer output
 // (the `SELECT *` expansion, the MySQL charset pin) independent of statement class, so every
 // understood-and-allowed decision — analyzed, metadata, session — routes it through this one point rather
-// than each building its own. An EXPLAIN-of-query keeps its original text (the rewrite is for the inner query
-// it plans). The exception.unanalyzable escape hatches deliberately relay the original whole statement, so they do
-// not call this.
+// than each building its own. An EXPLAIN/DESCRIBE keeps its original text — the analyzer emits no
+// rewritten_sql for it (the rewrite is for the inner query it plans). The exception.unanalyzable escape
+// hatches deliberately relay the original whole statement, so they do not call this.
 private fun DecisionContext.withAnalyzerRewrite(facts: StatementFacts): DecisionContext =
-    if (facts.hasRewrittenSql() && !facts.explainOfQuery) copy(rewrittenSql = facts.rewrittenSql) else this
+    if (facts.hasRewrittenSql()) copy(rewrittenSql = facts.rewrittenSql) else this
 
 // The Cedar action a statement's kind is gated by. "stmt.kind.<k>" is a member of its category action in
 // the schema, so a category or kind preset matches it; an admin-category kind with no preset denies —
@@ -942,11 +989,10 @@ fun Route.queryRoutes(
     runExecService: RunExecService,
 ) {
     post("/api/datasources/{id}/query") {
-        if (!call.requireApi(config)) return@post
+        val principal = call.requireApi() ?: return@post
         val id = call.idParam() ?: return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
         val ds = datasourceStore.get(id) ?: return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "datasource")))
         val req = call.receive<QueryRequest>()
-        val principal = call.userSession()?.principal ?: "debug-user"
         // Auto-save the run to the principal's editor history (best-effort; never blocks the query).
         runCatching { historyStore.add(principal, id, req.sql) }
         try {
@@ -963,8 +1009,13 @@ fun Route.queryRoutes(
             call.respond(HttpStatusCode.ServiceUnavailable, ApiError("query.proxy_stream_wedged"))
         } catch (_: ProxyRunTimeoutException) {
             call.respond(HttpStatusCode.GatewayTimeout, ApiError("query.proxy_timeout"))
+        } catch (e: TargetDbRunException) {
+            // The run's decision already chose the form (raw for a full reader, redacted for a masked one).
+            call.respond(HttpStatusCode.BadGateway, ApiError("query.failed", mapOf("detail" to e.decidedMessage)))
         } catch (e: ProxyRunException) {
-            call.respond(HttpStatusCode.BadGateway, ApiError("query.failed", mapOf("detail" to (e.message ?: ""))))
+            // A generic failure's text can echo the target host (`dial tcp 10.0.3.7:5432: …`) — log only.
+            call.application.environment.log.warn("query run failed", e)
+            call.respond(HttpStatusCode.BadGateway, ApiError("query.failed"))
         }
     }
 }
@@ -1011,11 +1062,10 @@ fun Route.editorSessionRoutes(
     taskCompletionHub: TaskCompletionHub? = null,
 ) {
     post("/api/editor/sessions") {
-        if (!call.requireApi(config)) return@post
+        val principal = call.requireApi() ?: return@post
         val input = call.receive<OpenEditorSessionInput>()
         val ds = datasourceStore.get(input.datasourceId)
             ?: return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "datasource")))
-        val principal = call.userSession()?.principal ?: "debug-user"
         try {
             call.respond(EditorSessionOpened(runExecService.openSession(principal, ds, call.httpRequesterIp(config))))
         } catch (_: NoProxyAttachedException) {
@@ -1025,17 +1075,18 @@ fun Route.editorSessionRoutes(
         } catch (_: ProxyRunTimeoutException) {
             call.respond(HttpStatusCode.GatewayTimeout, ApiError("query.proxy_timeout"))
         } catch (e: ProxyRunException) {
-            call.respond(HttpStatusCode.BadGateway, ApiError("query.failed", mapOf("detail" to (e.message ?: ""))))
+            // An open failure's text can echo the target host (`dial tcp 10.0.3.7:5432: …`) — log only.
+            call.application.environment.log.warn("editor session open failed", e)
+            call.respond(HttpStatusCode.BadGateway, ApiError("query.failed"))
         }
     }
 
     // Async submit: launch the run as an auto-approved EDITOR task on the held session and ACK 202 — no rows
     // inline (mirrors /api/approvals/{id}/execute). The web swaps its tab's taskId and polls to completion.
     post("/api/editor/sessions/{sessionId}/query") {
-        if (!call.requireApi(config)) return@post
+        val principal = call.requireApi() ?: return@post
         val sessionId = call.parameters["sessionId"]
             ?: return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val req = call.receive<QueryRequest>()
         val sql = req.sql
         if (sql.isBlank()) {
@@ -1055,15 +1106,12 @@ fun Route.editorSessionRoutes(
             ?: return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "datasource")))
         val store = queryResultStore
             ?: return@post call.respond(HttpStatusCode.ServiceUnavailable, ApiError("approval.result_storage_not_configured"))
-        // Self-approve on the editor channel: must clear task.request AND task.approve. authDebug bypasses.
-        if (!config.authDebug && !autoApproveTask(
-                principal, ownRoles, ds, call.httpAuthzContext(config), authz, Channel.EDITOR,
-            )
-        ) {
+        // Self-approve on the editor channel: must clear task.request AND task.approve.
+        if (!autoApproveTask(principal, ownRoles, ds, call.httpAuthzContext(config), authz, Channel.EDITOR)) {
             return@post call.respond(HttpStatusCode.Forbidden, ApiError("common.forbidden"))
         }
 
-        val task = accessStore.createEditorTask(principal, ds.id, sql, ownRoles.toList(), approver = principal)
+        val task = accessStore.createEditorTask(principal, ds.id, listOf(sql), ownRoles.toList(), approver = principal)
         val childId = accessStore.editorChildId(task.id) ?: -1L
         // Same single-execution claim as /execute, atomic so a cancel can't slip into an EXECUTING-but-no-
         // RUNNING-child gap: APPROVED → EXECUTING and the child NULL → RUNNING commit in one transaction.
@@ -1078,6 +1126,8 @@ fun Route.editorSessionRoutes(
             // tab can offer an approval request built from that decision instead of showing a bare error.
             var denyReason: String? = null
             var denyDecisionId: Long? = null
+            // The target-DB error behind a failure (both forms), stored so the FAILED view releases one per viewer.
+            var diagnostic: RunError? = null
             val failureCode = try {
                 // runOnSession decides on the EDITOR channel under empty assumeRoles (the caller's own roles)
                 // and saves the enforced result instead of returning it inline.
@@ -1096,7 +1146,7 @@ fun Route.editorSessionRoutes(
                     // localizes the polled code with no editor-specific catalog entries.
                     "approval.execute_denied"
                 } else {
-                    val result = DecryptedResult(response.columns, response.rows)
+                    val result = DecryptedResult(response.columns, response.rows, response.rowsAffected, response.resultFingerprint)
                     // Child DONE + parent EXECUTED commit in ONE transaction (see /execute): a crash can never
                     // leave a readable DONE child under a non-EXECUTED task. The run's per-statement Decide
                     // round-trip already wrote the real audit decision (ALLOW/MASK/DENY + decisionId), so no
@@ -1116,6 +1166,9 @@ fun Route.editorSessionRoutes(
                 "query.proxy_stream_wedged"
             } catch (_: ProxyRunTimeoutException) {
                 "query.proxy_timeout"
+            } catch (e: TargetDbRunException) {
+                diagnostic = e.toDiagnostic()
+                "approval.query_failed"
             } catch (_: ProxyRunException) {
                 "approval.query_failed"
             } catch (t: Throwable) {
@@ -1125,7 +1178,7 @@ fun Route.editorSessionRoutes(
             if (failureCode != null) {
                 // Child FAILED + parent FAILED in ONE transaction (mirrors the success path's single commit).
                 runCatching {
-                    store.failRun(task.id, failureCode, denyReason, denyDecisionId) { conn, _ ->
+                    store.failRun(task.id, failureCode, denyReason, denyDecisionId, diagnostic = diagnostic) { conn, _ ->
                         accessStore.markFailed(task.id, conn)
                     }
                 }
@@ -1141,56 +1194,44 @@ fun Route.editorSessionRoutes(
     // Poll: task status + child metadata. Owner-scoped to the caller's own EDITOR tasks (task.read/own);
     // 404 for a non-owner / non-EDITOR id, so it's not an existence oracle. Rows stay behind /result.
     get("/api/editor/tasks/{taskId}") {
-        if (!call.requireApi(config)) return@get
+        val principal = call.requireApi() ?: return@get
         val taskId = call.parameters["taskId"]?.toLongOrNull()
             ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val task = accessStore.getRequest(taskId)
         if (task == null || task.kind != "QUERY" || task.creatorKind != "EDITOR" || task.principal != principal) {
             return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "editor task")))
         }
         // task.read gates the metadata (status, row count, column names, error code, timestamps) — the owner
         // guard above is not a substitute: a Cedar forbid (e.g. task.read denied from an untrusted zone) must
-        // still override the self-read permit. authDebug bypasses, matching every other route's Cedar gate.
-        if (!config.authDebug) {
-            val mayRead = authz.authorizeWithContext(
-                principal, AuthzAction.TASK_READ,
-                AuthzResource.ApprovalRequest(
-                    requester = task.principal, approver = task.decidedBy, executedBy = task.executedBy,
-                    datasourceName = task.datasourceName, roleName = task.roleName,
-                ),
-                call.httpAuthzContext(config), task.datasourceName,
-                task.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
-            )
-            if (mayRead is AuthzDecision.Deny) {
-                return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "editor task")))
-            }
+        // still override the self-read permit.
+        val mayRead = authz.authorizeWithContext(
+            principal, AuthzAction.TASK_READ,
+            task.toApprovalResource(),
+            call.httpAuthzContext(config), task.datasourceName,
+            task.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
+        )
+        if (mayRead is AuthzDecision.Deny) {
+            return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "editor task")))
         }
         call.respond(EditorTaskStatus(task.id, task.status, queryResultStore?.meta(taskId)))
     }
 
     post("/api/editor/tasks/{taskId}/cancel") {
-        if (!call.requireApi(config)) return@post
+        val principal = call.requireApi() ?: return@post
         val taskId = call.parameters["taskId"]?.toLongOrNull()
             ?: return@post call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val task = accessStore.getRequest(taskId)
         if (task == null || task.kind != "QUERY" || task.creatorKind != "EDITOR" || task.principal != principal) {
             return@post call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "editor task")))
         }
-        if (!config.authDebug) {
-            val mayCancel = authz.authorizeWithContext(
-                principal, AuthzAction.TASK_CANCEL,
-                AuthzResource.ApprovalRequest(
-                    requester = task.principal, approver = task.decidedBy, executedBy = task.executedBy,
-                    datasourceName = task.datasourceName, roleName = task.roleName,
-                ),
-                call.httpAuthzContext(config), task.datasourceName,
-                task.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
-            )
-            if (mayCancel is AuthzDecision.Deny) {
-                return@post call.respond(HttpStatusCode.Forbidden, ApiError("approval.cancel_forbidden"))
-            }
+        val mayCancel = authz.authorizeWithContext(
+            principal, AuthzAction.TASK_CANCEL,
+            task.toApprovalResource(),
+            call.httpAuthzContext(config), task.datasourceName,
+            task.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
+        )
+        if (mayCancel is AuthzDecision.Deny) {
+            return@post call.respond(HttpStatusCode.Forbidden, ApiError("approval.cancel_forbidden"))
         }
         if (task.status != "EXECUTING") {
             return@post call.respond(EditorTaskStatus(task.id, task.status, queryResultStore?.meta(taskId)))
@@ -1216,10 +1257,9 @@ fun Route.editorSessionRoutes(
     // Rows: task.assume gates the viewer (no authDebug bypass — data confidentiality), then the stored result
     // is re-decided live under the task's execute-as roles on the EDITOR channel — mirrors the approval view.
     get("/api/editor/tasks/{taskId}/result") {
-        if (!call.requireApi(config)) return@get
+        val principal = call.requireApi() ?: return@get
         val taskId = call.parameters["taskId"]?.toLongOrNull()
             ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val task = accessStore.getRequest(taskId)
         // Owner-scoped (frozen contract): an editor result is readable ONLY by its own submitter. The
         // task.assume check below is defense-in-depth (the owner passes it via the task.assume-parties policy);
@@ -1238,40 +1278,34 @@ fun Route.editorSessionRoutes(
             ?: return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "editor task")))
         val mayAssume = authz.authorizeWithContext(
             principal, AuthzAction.TASK_ASSUME,
-            AuthzResource.ApprovalRequest(
-                requester = task.principal, approver = task.decidedBy, executedBy = task.executedBy,
-                datasourceName = task.datasourceName, roleName = task.roleName,
-            ),
-            call.httpAuthzContext(config), task.datasourceName,
+            task.toApprovalResource(),
+            call.httpAuthzContext(config, Channel.EDITOR), task.datasourceName,
             task.datasourceId?.let(datasourceStore::getIncludingDeleted)?.tags.orEmpty(),
         )
         if (mayAssume is AuthzDecision.Deny) {
             return@get call.respond(HttpStatusCode.NotFound, ApiError("common.not_found", mapOf("resource" to "editor task")))
         }
         val meta = access.meta
+        // One re-decision gates both the FAILED diagnostic and the DONE rows. Not audited here — the
+        // per-statement Decide already recorded it.
+        val ctx = viewerDecision(
+            principal, task, access.sql, call.httpAuthzContext(config),
+            datasourceStore, policyStore, accessStore, userGroupStore, roleResolver, authz,
+            systemClassification, Channel.EDITOR,
+        )
+        if (meta.status == "FAILED" && access.errorDetail != null) {
+            return@get call.respond(
+                QueryResultView(meta, emptyList(), emptyList(), errorDetail = failedDiagnosticForViewer(ctx, access.errorDetail)),
+            )
+        }
         if (meta.status != "DONE") {
             return@get call.respond(HttpStatusCode.Conflict, ApiError("approval.result_not_ready"))
         }
         val decrypted = access.decrypted
             ?: return@get call.respond(HttpStatusCode.Gone, ApiError("approval.result_expired"))
-        val viewDecision = when {
-            task.datasourceId == null -> ResultViewDecision.Denied("editor task has no datasource")
-            access.sql == null -> ResultViewDecision.Denied("saved result child has no SQL")
-            else -> {
-                val ds = datasourceStore.get(task.datasourceId)
-                if (ds == null) {
-                    ResultViewDecision.Denied("editor task datasource no longer exists")
-                } else {
-                    decideResultView(
-                        viewer = principal, req = task, childSql = access.sql, ds = ds, decrypted = decrypted,
-                        callerContext = call.httpAuthzContext(config), datasourceStore = datasourceStore,
-                        policyStore = policyStore, accessStore = accessStore, userGroupStore = userGroupStore,
-                        roleResolver = roleResolver, authz = authz, systemClassification = systemClassification,
-                        channel = Channel.EDITOR,
-                    )
-                }
-            }
-        }
+        val viewDecision =
+            if (ctx == null) ResultViewDecision.Denied("stored result has no live decision to re-mask under")
+            else decideResultView(ctx, decrypted)
         when (viewDecision) {
             is ResultViewDecision.Denied -> {
                 call.application.environment.log.warn(
@@ -1296,10 +1330,9 @@ fun Route.editorSessionRoutes(
     // Delete-on-close: drop the tab's saved rows + its task row (CASCADE). Owner-scoped + EDITOR-only, so a
     // leaked id can't delete another principal's task; a non-owner / unknown id is a silent, idempotent 204.
     delete("/api/editor/tasks/{taskId}") {
-        if (!call.requireApi(config)) return@delete
+        val principal = call.requireApi() ?: return@delete
         val taskId = call.parameters["taskId"]?.toLongOrNull()
             ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
-        val principal = call.userSession()?.principal ?: "debug-user"
         val task = accessStore.getRequest(taskId)
         if (task != null && task.kind == "QUERY" && task.creatorKind == "EDITOR" && task.principal == principal) {
             if (task.status == "EXECUTING") runExecService.cancelActiveRun(taskId)
@@ -1310,13 +1343,12 @@ fun Route.editorSessionRoutes(
     }
 
     delete("/api/editor/sessions/{sessionId}") {
-        if (!call.requireApi(config)) return@delete
+        val principal = call.requireApi() ?: return@delete
         val sessionId = call.parameters["sessionId"]
             ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiError("common.bad_id"))
         // Close only if the caller owns the session (mirrors runOnSession) — a leaked sessionId must not let
         // another principal tear down this connection. Idempotent NoContent regardless, so it's not an
         // existence oracle for someone else's session id.
-        val principal = call.userSession()?.principal ?: "debug-user"
         runExecService.closeSessionOwnedBy(sessionId, principal)
         call.respond(HttpStatusCode.NoContent)
     }

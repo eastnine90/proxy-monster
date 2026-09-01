@@ -10,13 +10,16 @@ import (
 	"github.com/ridi-oss/sqlglot-go/dialects"
 	exp "github.com/ridi-oss/sqlglot-go/expressions"
 	"github.com/ridi-oss/sqlglot-go/generator"
+	"github.com/ridi-oss/sqlglot-go/optimizer"
 	"github.com/ridi-oss/sqlglot-go/schema"
+	"github.com/ridi-oss/sqlglot-go/tokens"
 )
 
 var safeNoFromFunctions = stringSet(
 	"version", "current_schema", "current_schemas", "current_database", "current_catalog",
 	"current_user", "session_user", "current_role", "user", "database", "schema", "connection_id",
 	"pg_backend_pid", "pg_is_in_recovery", "pg_postmaster_start_time", "current_setting",
+	"txid_current", "pg_current_xact_id",
 	"inet_server_addr", "inet_server_port", "inet_client_addr", "inet_client_port",
 	"last_insert_id", "row_count", "found_rows", "charset", "collation", "coercibility",
 	"now", "current_timestamp", "current_date", "current_time", "localtime", "localtimestamp",
@@ -36,6 +39,34 @@ var safeNoFromFunctions = stringSet(
 	"cast", "convert", "coalesce", "nullif", "ifnull", "isnull", "nvl", "greatest", "least",
 	"iif", "if", "typeof", "pg_typeof",
 )
+
+// postgresInformationSchemaFunctions are PostgreSQL's information_schema helper builtins — stable,
+// read-only transforms of their arguments (pgJDBC metadata queries call them). Safe ONLY under an
+// explicit `information_schema.` qualifier; the unqualified spelling stays gated so a same-named
+// user function cannot inherit the pass.
+var postgresInformationSchemaFunctions = stringSet(
+	"_pg_char_max_length", "_pg_char_octet_length", "_pg_datetime_precision", "_pg_expandarray",
+	"_pg_index_position", "_pg_interval_type", "_pg_numeric_precision", "_pg_numeric_precision_radix",
+	"_pg_numeric_scale", "_pg_truetypid", "_pg_truetypmod",
+)
+
+func isTrustedInformationSchemaCall(qualifier exp.Expression, leaf string, eng engine) bool {
+	return eng.Type() == pb.Engine_POSTGRES && qualifier != nil &&
+		qualifier.Kind() == exp.KindIdentifier && qualifier.Name() == "information_schema" &&
+		postgresInformationSchemaFunctions[leaf]
+}
+
+// mysqlOnlySafeFunctions are safe no-FROM function names that exist ONLY on MySQL. `values` is MySQL's
+// INSERT … ON DUPLICATE KEY UPDATE pseudo-function — it names the value that would have been inserted, not a
+// callable function, and its lineage is traced in probe.go. PostgreSQL has no `values` builtin, so keeping
+// it out of the cross-engine set leaves a quoted PostgreSQL `"values"()` (a user function) gated.
+var mysqlOnlySafeFunctions = stringSet("values")
+
+// isSafeNoFromFunction reports whether a bare (unqualified) anonymous function name is a known-safe builtin
+// that needs no no-FROM Function grant — the cross-engine set plus any engine-specific pseudo-functions.
+func isSafeNoFromFunction(name string, eng engine) bool {
+	return safeNoFromFunctions[name] || (eng.Type() == pb.Engine_MYSQL && mysqlOnlySafeFunctions[name])
+}
 
 // userTypeCast returns the name of the first reference to a non-built-in (user) type anywhere in root, or
 // "" if every type reference is a safe built-in. sqlglot resolves a built-in type to a concrete DType and
@@ -89,6 +120,15 @@ func EmitFacts(sql string, engineConfig *pb.EngineConfig, sch *schema.Mapping, n
 		return unanalyzableFacts("VALIDATE", err.Error())
 	}
 
+	if emptyStatement(sql, eng) {
+		// A statement with no statements — "" / ";" / comment-only. Authorized as stmt.kind.empty
+		// under stmt.cat.session, then relayed so the target answers natively (PostgreSQL
+		// EmptyQueryResponse, MySQL ER_EMPTY_QUERY for blank, OK for comment-only).
+		facts := passthroughFacts()
+		facts.StatementExec = executeGrant(pb.StatementKind_STATEMENT_KIND_EMPTY)
+		return facts
+	}
+
 	var parsed []exp.Expression
 	if fail := runStage("PARSE", func() {
 		var parseErr error
@@ -106,7 +146,21 @@ func EmitFacts(sql string, engineConfig *pb.EngineConfig, sch *schema.Mapping, n
 	// Peel a whole-statement parenthesized wrapper: `(SELECT 1)` parses to a Subquery whose `this` is the
 	// real statement. Classification/lineage must run on the inner statement, not fail closed on the
 	// wrapper (a wrapped SELECT is ordinary chatter, a wrapped write is still a write).
-	root := unwrapSubquery(stmts[0])
+	// Fold identifiers ONCE, here, so every consumer below reads canonical spellings. Qualify does this
+	// as its own first step (optimizer.Qualify → NormalizeIdentifiers), but Qualify needs the catalog and
+	// runs only in VALIDATE — so the paths that never reach it, or that reach it and fail, were each
+	// left to fold by hand. Quote-aware, so a quoted identifier keeps its case: `"PG_CATALOG"` stays a
+	// distinct user schema from `pg_catalog`, and `"MySchema".fn` from `myschema.fn`.
+	root := optimizer.NormalizeIdentifiers(unwrapSubquery(stmts[0]), eng.Dialect())
+	if !hasSyntheticAlias(root) {
+		// A duplicate-label error is the target DB's own rejection (MySQL ER_DUP_FIELDNAME, a
+		// referenced PostgreSQL ambiguity) — the statement would never run there.
+		if err := stampNativeOutputLabels(root, eng); err != nil {
+			facts := inadmissibleFacts("VALIDATE", err.Error())
+			facts.StatementExec = executeGrant(statementKind(root, eng))
+			return facts
+		}
+	}
 	candidates := schemaQualifierCandidates(root)
 
 	var facts *pb.StatementFacts
@@ -119,12 +173,14 @@ func EmitFacts(sql string, engineConfig *pb.EngineConfig, sch *schema.Mapping, n
 		facts = emitSetFacts(root, eng)
 	case exp.KindCommand:
 		facts = emitCommandFacts(root, eng)
-	case exp.KindTransaction, exp.KindCommit, exp.KindRollback, exp.KindSavepoint, exp.KindUse, exp.KindAnalyze, exp.KindReset:
+	case exp.KindTransaction, exp.KindCommit, exp.KindRollback, exp.KindSavepoint, exp.KindUse, exp.KindReset:
 		// PostgreSQL `RESET <guc>` / `RESET ALL` (sqlglot-go v0.16 models it as a dedicated Reset node) only
 		// restores a session variable to its default — a de-escalation, never a privilege gain — so it is a
 		// benign session passthrough. (MySQL RESET MASTER/REPLICA is a privileged admin op that degrades to
 		// Command and is denied there; it never reaches this Reset-node case.)
 		facts = passthroughFacts()
+	case exp.KindAnalyze:
+		facts = emitAnalyzeFacts(root, eng, qualifySchema, validatedNamespace)
 	case exp.KindAlter, exp.KindDrop, exp.KindTruncateTable:
 		facts = ddlFacts(root, eng)
 	case exp.KindCreate:
@@ -191,13 +247,18 @@ func emitLineageFacts(root exp.Expression, eng engine, qualifySchema schema.Sche
 	}
 	report := probeParsed(root, eng, qualifySchema, namespace)
 	facts := factsFromProbe(report)
-	facts.ExplainOfQuery = explain
 	// The execute grant (the statement kind) is attached centrally in EmitFacts, for resolved and
 	// unresolved statements alike; here we only add the column/table RESULT_READ grants below.
 	if !facts.Resolved {
 		return facts
 	}
 
+	// An EXPLAIN — of a read or a write — returns the query PLAN, not rows. So a projected column is READ to
+	// build the plan but is NOT an output: emit it with no output ordinal, so it still needs a read grant
+	// (masked read is enough) yet binds no mask, and output_columns is left empty below for the same reason.
+	// A write EXPLAIN additionally keeps its DENY_STATEMENT payload protection via the IsWrite loop below, so
+	// materializing a masked column still denies. Every EXPLAIN grant must have an empty ordinal to match the
+	// empty output_columns — a stray ordinal would fail the mask-binding contract check (Query.kt).
 	for ordinal, origin := range report.Origins {
 		for _, key := range origin.Origins {
 			column, ok := columnResourceFromKey(key)
@@ -208,17 +269,28 @@ func emitLineageFacts(root exp.Expression, eng engine, qualifySchema schema.Sche
 			if origin.Derived {
 				disposition = pb.MaskedDisposition_MASKED_DISPOSITION_REDACT_OUTPUT_NULL
 			}
-			facts.ResultReads = append(facts.ResultReads, columnGrant(column, disposition, int32(ordinal)))
+			if explain {
+				facts.ResultReads = append(facts.ResultReads, columnGrant(column, disposition))
+			} else {
+				facts.ResultReads = append(facts.ResultReads, columnGrant(column, disposition, int32(ordinal)))
+			}
 		}
 	}
+	// Flatten and sort the reference columns: report.References is a map, so iterating it directly emits the
+	// DENY grants in a random order per run. The control-plane freezes these grants as a stored result's
+	// fingerprint and compares them for equality at view, so a nondeterministic order would make an unchanged
+	// query's fingerprint differ between execute and view and falsely deny the view.
+	refCols := []string{}
 	for _, refs := range report.References {
-		for _, key := range refs {
-			column, ok := columnResourceFromKey(key)
-			if !ok {
-				return unanalyzableFacts("LINEAGE", "invalid column identity emitted by analyzer")
-			}
-			facts.ResultReads = append(facts.ResultReads, columnGrant(column, pb.MaskedDisposition_MASKED_DISPOSITION_DENY_STATEMENT))
+		refCols = append(refCols, refs...)
+	}
+	sort.Strings(refCols)
+	for _, key := range refCols {
+		column, ok := columnResourceFromKey(key)
+		if !ok {
+			return unanalyzableFacts("LINEAGE", "invalid column identity emitted by analyzer")
 		}
+		facts.ResultReads = append(facts.ResultReads, columnGrant(column, pb.MaskedDisposition_MASKED_DISPOSITION_DENY_STATEMENT))
 	}
 	// Advisory, never authorization: this decides only whether the statement TEXT may be shown outside the
 	// console. An unparseable identity is skipped rather than failing the statement — a fact that can only
@@ -258,15 +330,42 @@ func emitLineageFacts(root exp.Expression, eng engine, qualifySchema schema.Sche
 	if len(report.Sources) == 0 {
 		facts.ResultReads = append(facts.ResultReads, noFromFunctionGrants(root, eng)...)
 	}
-	facts.OutputColumns = outputColumnNames(report)
 	facts.CatalogChanging = root.Kind() == exp.KindCreate && !isTemporaryDDL(root, eng)
 	if root.Kind() == exp.KindSelect && root.Arg("into") != nil {
 		facts.CatalogChanging = true
 	}
 	if explain {
+		// An EXPLAIN's output is the plan, not the query's columns: no output_columns (nothing to mask
+		// against), and relay the client's original text rather than a `*`-expanded rewrite.
+		facts.OutputColumns = nil
 		facts.RewrittenSql = nil
+	} else {
+		facts.OutputColumns = outputColumnNames(report)
 	}
+	facts.DiagnosticLeakColumns = diagnosticLeakColumns(report, eng, qualifySchema)
 	return facts
+}
+
+// diagnosticLeakColumns converts the engine's leak-key set to sorted ColumnResources, so the
+// control-plane's frozen-facts comparison never churns on order.
+func diagnosticLeakColumns(report ProbeResult, eng engine, qualifySchema schema.Schema) []*pb.ColumnResource {
+	keys := eng.DiagnosticLeakKeys(report, qualifySchema)
+	sorted := make([]string, 0, len(keys))
+	for key := range keys {
+		sorted = append(sorted, key)
+	}
+	sort.Strings(sorted)
+	out := make([]*pb.ColumnResource, 0, len(sorted))
+	for _, key := range sorted {
+		column, ok := columnResourceFromKey(key)
+		if !ok {
+			// A key that doesn't split 4-ways (a column named "ssn.secret") must fail closed, not vanish:
+			// emit it as a column no catalog resolves.
+			column = &pb.ColumnResource{Identity: &pb.RelationIdentity{Column: key}}
+		}
+		out = append(out, column)
+	}
+	return out
 }
 
 // isTemporaryDDL reports whether a DDL root targets only session-local (temporary) objects, whose
@@ -317,10 +416,59 @@ func emitDescribeFacts(root exp.Expression, eng engine, qualifySchema schema.Sch
 	if this != nil && this.Kind() == exp.KindTable {
 		return passthroughFacts()
 	}
-	if isKnownRoot(this) {
-		return emitLineageFacts(this, eng, qualifySchema, namespace, true)
+	// `EXPLAIN (SELECT …)` wraps the query in a Subquery (parentheses are real syntax); peel it so a
+	// parenthesized target is analyzed like a bare one. The kind (plan-only EXPLAIN, or the inner write for
+	// an executing EXPLAIN ANALYZE) is decided centrally by describeKind; here we only trace the inner
+	// query's lineage.
+	if inner := unwrapSubquery(this); isKnownRoot(inner) {
+		return emitLineageFacts(inner, eng, qualifySchema, namespace, true)
 	}
 	return unanalyzableFacts("PARSE", "DESCRIBE target is not a table or analyzable statement")
+}
+
+// explainInnerIsPlanOnlyRead reports whether an EXPLAIN's inner statement is a PROVABLE pure read — the
+// only case that becomes the read-shaped plan-only EXPLAIN kind (its projected columns are read-required
+// with no output ordinal, so a `context.stmt_kind == "explain"` policy can read them unmasked). A
+// whitelist, deliberately, not a write blacklist: anything not provably a read — a write root, an
+// as-yet-unmodeled root, a `SELECT … INTO`, or a data-modifying CTE — keeps its own kind, so it authorizes
+// and denies (payload DENY_STATEMENT) as that statement. A newly modeled write shape therefore fails closed
+// instead of silently reclassifying as a read.
+func explainInnerIsPlanOnlyRead(inner exp.Expression) bool {
+	if !inner.Is(exp.TraitSetOperation) && inner.Kind() != exp.KindSelect {
+		return false
+	}
+	if len(inner.FindAll(exp.KindInto)) > 0 {
+		return false // SELECT … INTO OUTFILE / a new table materializes
+	}
+	for _, k := range []exp.Kind{exp.KindInsert, exp.KindUpdate, exp.KindDelete, exp.KindMerge} {
+		if len(inner.FindAll(k)) > 0 {
+			return false // a data-modifying CTE writes
+		}
+	}
+	return true
+}
+
+// emitAnalyzeFacts gates a table-targeted ANALYZE the same way DESCRIBE is: a table statistics command
+// reveals the table's existence and touches its rows, so it must carry the same result-read grant a
+// `SELECT * FROM <table>` would (routed through lineage with explain = true — read-required, not row
+// masking). Without it the statement resolves connect-only and becomes an existence oracle that bypasses
+// the result-read gate. The single-table target is exact: a multi-table `ANALYZE TABLE t1, t2` leaves the
+// list tail unconsumed and the parser degrades the whole statement to Command, which never reaches here.
+// The statement-kind exec grant is attached centrally in EmitFacts, so the kind gate applies regardless.
+func emitAnalyzeFacts(root exp.Expression, eng engine, qualifySchema schema.Schema, namespace NamespaceConfig) *pb.StatementFacts {
+	this := root.This()
+	kind := ""
+	if k := root.Arg("kind"); k != nil {
+		kind = strings.ToUpper(fmt.Sprint(k))
+	}
+	// MySQL `ANALYZE TABLE t` (kind TABLE) and PostgreSQL/Presto `ANALYZE t` (no kind) both target one table
+	// to read. INDEX / DATABASE / CLUSTER / bare all-table ANALYZE carry no single readable table target and
+	// stay a benign passthrough — still exec-gated by the statement kind.
+	if (kind == "TABLE" || kind == "") && this != nil && this.Kind() == exp.KindTable {
+		selectRoot := exp.Select(exp.Args{"expressions": []exp.Expression{exp.Star(nil)}, "from_": exp.From(exp.Args{"this": this.Copy()})})
+		return emitLineageFacts(selectRoot, eng, qualifySchema, namespace, true)
+	}
+	return passthroughFacts()
 }
 
 func emitShowFacts(root exp.Expression, eng engine) *pb.StatementFacts {
@@ -598,20 +746,37 @@ func noFromFunctionGrants(root exp.Expression, eng engine) []*pb.RequireResultRe
 		}
 		qualified[fn] = true
 		leaf := strings.ToLower(fn.Name())
-		if isTrustedSystemQualifier(dot.Left(), eng) {
+		if eng.IsTrustedSystemQualifier(dot.Left()) {
 			if !safeNoFromFunctions[leaf] {
 				emit(leaf)
 			}
 			continue
 		}
+		if isTrustedInformationSchemaCall(dot.Left(), leaf, eng) {
+			continue
+		}
 		emit(qualifiedCallName(dot.Left(), leaf, eng))
+	}
+	// A FROM-form call carries its qualifier on the Table node, not a Dot wrapper.
+	for _, table := range root.FindAll(exp.KindTable) {
+		fn := table.This()
+		if fn == nil || !fn.Is(exp.TraitFunc) || table.Arg("catalog") != nil {
+			continue
+		}
+		schema, _ := table.Arg("schema").(exp.Expression)
+		if schema == nil {
+			continue
+		}
+		if isTrustedInformationSchemaCall(schema, strings.ToLower(fn.Name()), eng) {
+			qualified[fn] = true
+		}
 	}
 	for _, fn := range root.FindAll(exp.TraitFunc) {
 		if fn.Kind() != exp.KindAnonymous || qualified[fn] {
 			continue
 		}
 		name := strings.ToLower(fn.Name())
-		if safeNoFromFunctions[name] {
+		if isSafeNoFromFunction(name, eng) {
 			continue
 		}
 		emit(name)
@@ -619,29 +784,9 @@ func noFromFunctionGrants(root exp.Expression, eng engine) []*pb.RequireResultRe
 	return out
 }
 
-// isTrustedSystemQualifier reports whether a call/type qualifier is the ONE trusted system-schema form:
-// a single bare identifier that resolves to PostgreSQL's `pg_catalog`. Trust is decided on the qualifier
-// folded through the dialect's quote-aware NormalizeIdentifier, NOT a raw EqualFold — an UNQUOTED
-// `PG_CATALOG` folds to `pg_catalog` (trusted), but a QUOTED `"PG_CATALOG"` stays case-sensitive and is a
-// DISTINCT user schema PostgreSQL's case-sensitive `pg_` reservation allows to exist, so it must NOT be
-// trusted (a user function there would otherwise inherit a system builtin's pass). It is also engine-gated:
-// `pg_catalog` is a PostgreSQL schema, so a MySQL database literally named `pg_catalog` is ordinary user
-// code and never trusted. A multi-part qualifier (its left side is itself a Dot, i.e. `db.pg_catalog` /
-// `current_database().public`) is never trusted either — its leaf spelling `pg_catalog` must not smuggle a
-// call into the safe branch — so it fails this test and its call/type is emitted with a full qualified
-// identity the control-plane cannot classify as safe.
-func isTrustedSystemQualifier(qualifier exp.Expression, eng engine) bool {
-	if qualifier == nil || eng.Type() != pb.Engine_POSTGRES || qualifier.Kind() != exp.KindIdentifier {
-		return false
-	}
-	folded := qualifier.Copy()
-	eng.Dialect().NormalizeIdentifier(folded)
-	return folded.Name() == "pg_catalog"
-}
-
 // qualifiedCallName renders a user-code call's fully-qualified identity so it is always an unclassified
-// Function grant. The single-identifier qualifier is folded through the dialect's quote-aware
-// NormalizeIdentifier — matching how the analyzer resolves every other relation, so the emitted name keys
+// Function grant. The single-identifier qualifier arrives already folded (EmitFacts normalizes up front,
+// quote-aware) — matching how the analyzer resolves every other relation, so the emitted name keys
 // identically to the control-plane's catalog (`"MySchema".fn` and `myschema.fn` stay DISTINCT rather than
 // both collapsing to one lowercased name a classification could ride). A multi-part qualifier is rendered
 // whole (`current_database().public.fn`) so the leaf never stands alone; that rendered form is always an
@@ -652,9 +797,7 @@ func qualifiedCallName(qualifier exp.Expression, leaf string, eng engine) string
 			return strings.ToLower(rendered) + "." + leaf
 		}
 	}
-	folded := qualifier.Copy()
-	eng.Dialect().NormalizeIdentifier(folded)
-	return folded.Name() + "." + leaf
+	return qualifier.Name() + "." + leaf
 }
 
 func unsafeExpression(value any, eng engine) bool {
@@ -694,10 +837,13 @@ func hasUnsafeCall(root exp.Expression, eng engine) bool {
 			continue
 		}
 		qualified[fn] = true
-		if isTrustedSystemQualifier(dot.Left(), eng) {
+		if eng.IsTrustedSystemQualifier(dot.Left()) {
 			if !safeNoFromFunctions[strings.ToLower(fn.Name())] {
 				return true
 			}
+			continue
+		}
+		if isTrustedInformationSchemaCall(dot.Left(), normalizedFunctionName(fn, eng), eng) {
 			continue
 		}
 		return true
@@ -711,7 +857,7 @@ func hasUnsafeCall(root exp.Expression, eng engine) bool {
 			continue
 		}
 		name := strings.ToLower(fn.Name())
-		if name != "" && name != "*" && !safeNoFromFunctions[name] {
+		if name != "" && name != "*" && !isSafeNoFromFunction(name, eng) {
 			return true
 		}
 	}
@@ -725,16 +871,12 @@ func showUtilityCommand(root exp.Expression) string {
 		return "SHOW_WARNINGS"
 	case "ERRORS":
 		return "SHOW_ERRORS"
-	case "PROCESSLIST":
-		return "SHOW_PROCESSLIST"
 	case "BINLOG EVENTS":
 		return "SHOW_BINLOG_EVENTS"
 	case "RELAYLOG EVENTS":
 		return "SHOW_RELAYLOG_EVENTS"
 	case "ENGINE":
 		return "SHOW_ENGINE_STATUS"
-	case "GRANTS":
-		return "SHOW_GRANTS"
 	case "REPLICA STATUS", "SLAVE STATUS":
 		return "SHOW_REPLICA_STATUS"
 	case "CREATE USER":
@@ -857,6 +999,22 @@ func utilityGrant(command string) *pb.RequireResultReadGrant {
 	}
 }
 
+// emptyStatement reports whether sql tokenizes to nothing but statement separators — the wire
+// protocols' "empty query". A tokenizer error (an unterminated comment) is NOT empty: it goes down
+// the ordinary parse path and fails closed there.
+func emptyStatement(sql string, eng engine) bool {
+	toks, err := sqlglot.Tokenize(sql, eng.Dialect())
+	if err != nil {
+		return false
+	}
+	for _, tok := range toks {
+		if tok.TokenType != tokens.SEMICOLON {
+			return false
+		}
+	}
+	return true
+}
+
 func passthroughFacts() *pb.StatementFacts {
 	return &pb.StatementFacts{Resolved: true, Detail: "ok"}
 }
@@ -895,11 +1053,29 @@ func ddlFacts(root exp.Expression, eng engine) *pb.StatementFacts {
 		Resolved:     true,
 		FailureClass: pb.FailureClass_FAILURE_CLASS_UNSPECIFIED,
 		// A temp-scoped DDL target is session-local, so it changes no shared catalog and must not force
-		// every other connection to re-measure.
-		CatalogChanging: !isTemporaryDDL(root, eng),
+		// every other connection to re-measure. Account-object DDL (CREATE/ALTER/DROP USER|ROLE) changes
+		// accounts/roles, not the column catalog the proxy re-measures for masking, so it is not
+		// catalog-changing either — it relays as a no-column passthrough, which keeps a statement result
+		// like CREATE USER … IDENTIFIED BY RANDOM PASSWORD viewable rather than dropped for column mismatch.
+		CatalogChanging: !isTemporaryDDL(root, eng) && !isAccountObjectDDL(root),
 	}
 }
 
+// isAccountObjectDDL is true for CREATE/ALTER/DROP of a USER or ROLE — account management that touches no
+// table or column, so unlike schema DDL it changes no catalog the proxy re-measures.
+func isAccountObjectDDL(root exp.Expression) bool {
+	switch objectKindText(root) {
+	case "USER", "ROLE":
+		return true
+	}
+	return false
+}
+
+// schemaQualifierCandidates collects every schema the statement names, so a caller holding a partial
+// catalog can fetch the ones it lacks. The names are the target DB's own spelling — EmitFacts folds the
+// statement's identifiers before this runs — because a candidate is used to look that schema up: MySQL
+// under lower_case_table_names=1 reports information_schema lowercase, so an unfolded `GOODS_STORE`
+// would match nothing.
 func schemaQualifierCandidates(root exp.Expression) []string {
 	set := map[string]bool{}
 	for _, table := range root.FindAll(exp.KindTable) {

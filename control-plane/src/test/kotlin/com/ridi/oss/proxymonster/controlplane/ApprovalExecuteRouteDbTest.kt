@@ -1,16 +1,21 @@
 package com.ridi.oss.proxymonster.controlplane
 
+
+import com.ridi.oss.proxymonster.controlplane.authz.CedarPolicyInput
 import com.ridi.oss.proxymonster.controlplane.grpc.CONTROL_PROTOCOL_VERSION
 import com.ridi.oss.proxymonster.controlplane.grpc.ControlPlaneGrpcService
 import com.ridi.oss.proxymonster.controlplane.grpc.GrpcServer
 import com.ridi.oss.proxymonster.controlplane.support.SharedPostgres
 import com.ridi.oss.proxymonster.controlplane.support.requireDockerOrSkip
+import com.ridi.oss.proxymonster.controlplane.support.testLoginRoute
 import com.ridi.oss.proxymonster.controlplane.support.webSessionCookie
 import com.ridi.oss.proxymonster.grpc.ControlPlaneGrpcKt
 import com.ridi.oss.proxymonster.grpc.EnfAction as WireEnfAction
 import com.ridi.oss.proxymonster.grpc.ProxyRunMsg
+import com.ridi.oss.proxymonster.grpc.RunDecision
 import com.ridi.oss.proxymonster.grpc.runDecision
 import com.ridi.oss.proxymonster.grpc.runDone
+import com.ridi.oss.proxymonster.grpc.runError
 import com.ridi.oss.proxymonster.grpc.runResultRows
 import com.ridi.oss.proxymonster.grpc.runRow
 import com.ridi.oss.proxymonster.grpc.runReady
@@ -27,19 +32,15 @@ import io.ktor.client.plugins.cookies.HttpCookies
 import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
-import io.ktor.server.application.Application
 import io.ktor.server.application.install
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.server.response.respond
-import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import io.ktor.server.sessions.Sessions
-import io.ktor.server.sessions.sessions
-import io.ktor.server.sessions.set
 import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import kotlinx.coroutines.CompletableDeferred
@@ -63,7 +64,9 @@ import java.util.concurrent.TimeUnit
 import javax.sql.DataSource
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
@@ -77,9 +80,9 @@ import kotlin.test.fail
  * the fake proxy's Events/runExec streams land on the same `proxyEventsHub` — mirrors
  * `GrpcRunExecDbTest`) so the DENY plays back over the real execute-under-R wire path, not a mock.
  *
- * Runs under `authDebug=true` (the executor principal is the literal `debug-user`): `mayDecide`
- * short-circuits true under authDebug, isolating the DENY branch from the R-scoped authority gate — that
- * gate gets its own coverage in [ElevationContextRouteAuthzDbTest].
+ * The fixture grants the executor `task.approve` outright, clearing `mayDecide` so the DENY branch is
+ * isolated from the R-scoped authority gate, which gets its own coverage in
+ * [ElevationContextRouteAuthzDbTest].
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class ApprovalExecuteRouteDbTest {
@@ -93,7 +96,9 @@ class ApprovalExecuteRouteDbTest {
     private lateinit var stub: ControlPlaneGrpcKt.ControlPlaneCoroutineStub
     private lateinit var rawChannel: ManagedChannel
 
-    private val executor = "debug-user" // the authDebug fallback principal (no session cookie is sent)
+    private lateinit var sessionStore: PrincipalSessionStore
+
+    private val executor = "approver@example.com"
     private val requester = "requester@example.com"
 
     @BeforeAll
@@ -104,20 +109,34 @@ class ApprovalExecuteRouteDbTest {
         core = ControlPlaneCore(dataSource)
         runExecService = RunExecService(core)
         resultStore = QueryResultStore(dataSource, ResultCrypto(ByteArray(32) { it.toByte() }))
+        sessionStore = PrincipalSessionStore(dataSource, null)
 
         datasource = core.datasourceStore.create(
             DatasourceInput(name = "exec-route-ds", engine = "postgres", host = "localhost", port = 5432, dbName = "app"),
         )
 
-        // debug-user (the authDebug fallback executor) is registered as an app_user; authDebug bypasses the
-        // approve-authority gate, isolating the execute-under-R branch under test.
+        // The executor holds a real task.approve grant, clearing mayDecide — which is what isolates the
+        // branches actually under test here (the execute-under-R DENY floor and the approver-of-record
+        // identity check) from the authority gate in front of them.
         core.userGroupStore.createUser(
-            AppUserInput(principal = executor), core.tokenStore, core.accessStore,
-            PrincipalSessionStore(dataSource, null),
+            AppUserInput(principal = executor), core.tokenStore, core.accessStore, sessionStore,
+        )
+        // task.read and task.cancel come along because the suite drives the console's own sequence — read the
+        // detail, execute, cancel the in-flight run — and each of those asks its own Cedar question.
+        core.cedarPolicyStore.create(
+            CedarPolicyInput(
+                name = "exec-route-test-task-authority",
+                cedarSrc = """permit(
+                    principal == User::"$executor",
+                    action in [Action::"task.approve", Action::"task.read", Action::"task.cancel"],
+                    resource
+                );""",
+            ),
+            updatedBy = null,
         )
 
         config = Config(
-            httpPort = 0, dbUrl = "", dbUser = "", dbPassword = "", authDebug = true, secretToken = null,
+            httpPort = 0, dbUrl = "", dbUser = "", dbPassword = "", authDebug = false, secretToken = null,
             sessionSecret = "exec-route-test-secret", oidc = null, resultKey = null, scimToken = null,
             sessionWindowSeconds = 3600, idpRecheckIntervalSeconds = 600, devMarker = true,
         )
@@ -143,15 +162,20 @@ class ApprovalExecuteRouteDbTest {
         require(predicate()) { "timed out awaiting: $what" }
     }
 
+    /** The routes plus a client; sign it in with [login] before driving anything. */
     private fun ApplicationTestBuilder.wire(): HttpClient {
         application {
+            attributes.put(PRINCIPAL_SESSION_STORE, sessionStore)
             install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true; encodeDefaults = true }) }
+            install(Sessions) { webSessionCookie(sessionStore, config.sessionSecret) }
             routing {
+                testLoginRoute(sessionStore, config)
                 approvalRoutes(
                     config, core.accessStore, core.auditStore, core.datasourceStore, core.policyStore,
                     core.userGroupStore, resultStore, core.roleResolver,
                     core.authz, runExecService,
                 )
+                queryRoutes(config, core.datasourceStore, QueryHistoryStore(dataSource), runExecService)
             }
         }
         return createClient {
@@ -161,32 +185,11 @@ class ApprovalExecuteRouteDbTest {
         }
     }
 
-    private fun ApplicationTestBuilder.wireAuthenticated(): HttpClient {
-        val cfg = config.copy(authDebug = false)
-        val sessionStore = PrincipalSessionStore(dataSource, null)
-        application {
-            attributes.put(PRINCIPAL_SESSION_STORE, sessionStore)
-            install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true; encodeDefaults = true }) }
-            install(Sessions) { webSessionCookie(sessionStore, cfg.sessionSecret) }
-            routing {
-                post("/test/session/{principal}") {
-                    val deviceId = call.ensureDeviceCookie(secure = false)
-                    call.sessions.set(
-                        WebSessionRef(sessionStore.mintWeb(requireNotNull(call.parameters["principal"]), null, 7200, 900, deviceId)),
-                    )
-                    call.respond(HttpStatusCode.NoContent)
-                }
-                approvalRoutes(
-                    cfg, core.accessStore, core.auditStore, core.datasourceStore, core.policyStore,
-                    core.userGroupStore, resultStore, core.roleResolver, core.authz, runExecService,
-                )
-            }
-        }
-        return createClient {
-            expectSuccess = false
-            install(HttpCookies)
-            install(ClientContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
-        }
+    /** [wire]'d client, signed in as the approver of record every seeded request defaults to. */
+    private suspend fun ApplicationTestBuilder.wireAsExecutor(): HttpClient = wire().also { it.login(executor) }
+
+    private suspend fun HttpClient.login(principal: String) {
+        assertEquals(HttpStatusCode.NoContent, post("/test/session/$principal").status)
     }
 
     /** A QUERY request elevating [requester] to a fresh role R on [datasource], already APPROVED —
@@ -195,7 +198,7 @@ class ApprovalExecuteRouteDbTest {
     private fun seedApprovedRoleRequest(roleName: String, decidedBy: String = executor): Long {
         val roleId = core.policyStore.createRole(RoleInput(roleName)).id
         val id = core.accessStore.createQueryRequest(
-            principal = requester, datasourceId = datasource.id, sql = "select ssn from users",
+            principal = requester, datasourceId = datasource.id, statements = listOf("select ssn from users"),
             denyReason = null, sourceDecisionId = null, reason = "need it", title = null,
             evaluatedDecision = "DENY", roleId = roleId,
         ).id
@@ -220,7 +223,7 @@ class ApprovalExecuteRouteDbTest {
 
     @Test
     fun `a DENY-under-R at execute leaks no result and stores nothing (fail-closed floor)`() = testApplication {
-        val client = wire()
+        val client = wireAsExecutor()
         val roleR = "exec-deny-role"
         val id = seedApprovedRoleRequest(roleR)
 
@@ -291,6 +294,218 @@ class ApprovalExecuteRouteDbTest {
         }
     }
 
+    @Test
+    fun `a target-DB statement error stores the backend text as assume-gated error_detail`() = testApplication {
+        val client = wireAsExecutor()
+        val id = seedApprovedRoleRequest("exec-targetdb-err-role")
+
+        supervisorScope {
+            val event = async { stub.events(eventsRequest { datasourceName = datasource.name; protocolVersion = CONTROL_PROTOCOL_VERSION }).first() }
+            awaitUntil("Events stream attached") { datasource.name in core.proxyEventsHub.attached() }
+
+            val responseDeferred = async { client.post("/api/approvals/$id/execute") }
+            val open = withTimeout(5_000) { event.await() }.openRunChannel
+
+            val proxyRequests = Channel<ProxyRunMsg>(Channel.UNLIMITED)
+            val proxy = async {
+                stub.runExec(proxyRequests.receiveAsFlow()).collect { control ->
+                    when {
+                        // The runner sends the statement's decision, then the target DB's own ERR tagged with
+                        // its provenance (already diagnostic-redacted at the wire).
+                        control.hasQuery() -> {
+                            proxyRequests.send(proxyRunMsg { decision = runDecision { decision = WireEnfAction.ALLOW } })
+                            proxyRequests.send(
+                                proxyRunMsg {
+                                    error = runError {
+                                        message = "ERROR: 42P01 undefined_table"
+                                        targetDbError = true
+                                        rawMessage = "ERROR: relation \"nope\" does not exist"
+                                    }
+                                },
+                            )
+                        }
+                        control.hasClose() -> proxyRequests.close()
+                        else -> fail("control plane sent an empty editor control message")
+                    }
+                }
+            }
+            proxyRequests.send(proxyRunMsg { sessionReady = runReady { sessionId = open.sessionId } })
+            proxyRequests.send(proxyRunMsg { serving = runServing {} })
+
+            val response = withTimeout(5_000) { responseDeferred.await() }
+            withTimeout(5_000) { proxy.await() }
+
+            assertEquals(HttpStatusCode.Accepted, response.status)
+            awaitUntil("target-DB error marks task and child failed") {
+                core.accessStore.getRequest(id)?.status == "FAILED" && resultStore.meta(id)?.status == "FAILED"
+            }
+            // The metadata poll keeps the generic code; both text forms ride only on accessFor.
+            assertEquals("approval.query_failed", resultStore.meta(id)?.errorCode)
+            assertEquals(
+                runError { message = "ERROR: 42P01 undefined_table"; rawMessage = "ERROR: relation \"nope\" does not exist"; targetDbError = true },
+                resultStore.accessFor(id)?.errorDetail,
+            )
+
+            awaitUntil("Events stream detached") { datasource.name !in core.proxyEventsHub.attached() }
+        }
+    }
+
+    // Drives POST /query against a stub proxy that answers the statement with a target-DB ERR under the given
+    // decision, and returns the HTTP response body.
+    private suspend fun ApplicationTestBuilder.queryFailsWith(
+        client: HttpClient,
+        decision: RunDecision,
+    ): String {
+        var body = ""
+        supervisorScope {
+            val event = async { stub.events(eventsRequest { datasourceName = datasource.name; protocolVersion = CONTROL_PROTOCOL_VERSION }).first() }
+            awaitUntil("Events stream attached") { datasource.name in core.proxyEventsHub.attached() }
+
+            val responseDeferred = async {
+                client.post("/api/datasources/${datasource.id}/query") {
+                    contentType(ContentType.Application.Json); setBody(QueryRequest("select 1", 100))
+                }
+            }
+            val open = withTimeout(5_000) { event.await() }.openRunChannel
+
+            val proxyRequests = Channel<ProxyRunMsg>(Channel.UNLIMITED)
+            val proxy = async {
+                stub.runExec(proxyRequests.receiveAsFlow()).collect { control ->
+                    when {
+                        control.hasQuery() -> {
+                            proxyRequests.send(proxyRunMsg { this.decision = decision })
+                            proxyRequests.send(
+                                proxyRunMsg {
+                                    error = runError {
+                                        message = "ERROR: 42P01 undefined_table"
+                                        targetDbError = true
+                                        rawMessage = "ERROR: relation \"secret_table\" does not exist"
+                                    }
+                                },
+                            )
+                        }
+                        control.hasClose() -> proxyRequests.close()
+                        else -> fail("control plane sent an empty run control message")
+                    }
+                }
+            }
+            proxyRequests.send(proxyRunMsg { sessionReady = runReady { sessionId = open.sessionId } })
+            proxyRequests.send(proxyRunMsg { serving = runServing {} })
+
+            val response = withTimeout(5_000) { responseDeferred.await() }
+            withTimeout(5_000) { proxy.await() }
+
+            assertEquals(HttpStatusCode.BadGateway, response.status)
+            body = response.bodyAsText()
+
+            awaitUntil("Events stream detached") { datasource.name !in core.proxyEventsHub.attached() }
+        }
+        return body
+    }
+
+    @Test
+    fun `the synchronous query route redacts the target-DB error when the decision sanitized diagnostics`() = testApplication {
+        val client = wireAsExecutor()
+        val body = queryFailsWith(
+            client,
+            runDecision { decision = WireEnfAction.MASK; sanitizeDiagnostics = true },
+        )
+        assertTrue(body.contains("ERROR: 42P01 undefined_table"), "the redacted form is returned: $body")
+        assertFalse(body.contains("secret_table"), "the raw target-DB text must never reach a sanitized caller: $body")
+    }
+
+    @Test
+    fun `the synchronous query route returns the raw target-DB error when the decision did not sanitize`() = testApplication {
+        val client = wireAsExecutor()
+        val body = queryFailsWith(
+            client,
+            runDecision { decision = WireEnfAction.ALLOW },
+        )
+        assertTrue(body.contains("secret_table"), "a non-sanitizing decision releases the raw form: $body")
+    }
+
+    @Test
+    fun `the synchronous query route does not leak a pre-decision open failure's internal detail`() = testApplication {
+        // A pre-serving open/connect failure (no query decision made) echoes the target host. The generic
+        // catch must return only the stable code, never that internal text.
+        val client = wireAsExecutor()
+
+        supervisorScope {
+            val event = async { stub.events(eventsRequest { datasourceName = datasource.name; protocolVersion = CONTROL_PROTOCOL_VERSION }).first() }
+            awaitUntil("Events stream attached") { datasource.name in core.proxyEventsHub.attached() }
+
+            val responseDeferred = async {
+                client.post("/api/datasources/${datasource.id}/query") {
+                    contentType(ContentType.Application.Json); setBody(QueryRequest("select 1", 100))
+                }
+            }
+            val open = withTimeout(5_000) { event.await() }.openRunChannel
+
+            val proxyRequests = Channel<ProxyRunMsg>(Channel.UNLIMITED)
+            val proxy = async {
+                stub.runExec(proxyRequests.receiveAsFlow()).collect { control ->
+                    if (control.hasClose()) proxyRequests.close()
+                }
+            }
+            proxyRequests.send(proxyRunMsg { sessionReady = runReady { sessionId = open.sessionId } })
+            // Open fails BEFORE serving (no decision), with a connection error that echoes the target host.
+            proxyRequests.send(proxyRunMsg { error = runError { message = "target-DB connection failed: dial tcp secret-host.internal:5432: connection refused" } })
+
+            val response = withTimeout(5_000) { responseDeferred.await() }
+            proxyRequests.close()
+            withTimeout(5_000) { proxy.await() }
+
+            assertEquals(HttpStatusCode.BadGateway, response.status)
+            assertFalse(
+                response.bodyAsText().contains("secret-host.internal"),
+                "a pre-decision open error must not leak the target host to the caller",
+            )
+            awaitUntil("Events stream detached") { datasource.name !in core.proxyEventsHub.attached() }
+        }
+    }
+
+    @Test
+    fun `a non-target post-serving failure fails with a generic code and NULL error_detail`() = testApplication {
+        val client = wireAsExecutor()
+        val id = seedApprovedRoleRequest("exec-generic-err-role")
+
+        supervisorScope {
+            val event = async { stub.events(eventsRequest { datasourceName = datasource.name; protocolVersion = CONTROL_PROTOCOL_VERSION }).first() }
+            awaitUntil("Events stream attached") { datasource.name in core.proxyEventsHub.attached() }
+
+            val responseDeferred = async { client.post("/api/approvals/$id/execute") }
+            val open = withTimeout(5_000) { event.await() }.openRunChannel
+
+            val proxyRequests = Channel<ProxyRunMsg>(Channel.UNLIMITED)
+            val proxy = async {
+                stub.runExec(proxyRequests.receiveAsFlow()).collect { control ->
+                    when {
+                        // A decode/decision/mask-binding failure the proxy reports post-serving — untagged.
+                        control.hasQuery() -> proxyRequests.send(
+                            proxyRunMsg { error = runError { message = "decision failed: analyzer unavailable" } },
+                        )
+                        control.hasClose() -> proxyRequests.close()
+                        else -> fail("control plane sent an empty editor control message")
+                    }
+                }
+            }
+            proxyRequests.send(proxyRunMsg { sessionReady = runReady { sessionId = open.sessionId } })
+            proxyRequests.send(proxyRunMsg { serving = runServing {} })
+
+            val response = withTimeout(5_000) { responseDeferred.await() }
+            withTimeout(5_000) { proxy.await() }
+
+            assertEquals(HttpStatusCode.Accepted, response.status)
+            awaitUntil("generic failure marks task and child failed") {
+                core.accessStore.getRequest(id)?.status == "FAILED" && resultStore.meta(id)?.status == "FAILED"
+            }
+            assertEquals("approval.query_failed", resultStore.meta(id)?.errorCode)
+            assertNull(resultStore.accessFor(id)?.errorDetail, "a non-target failure's text is never stored or released")
+
+            awaitUntil("Events stream detached") { datasource.name !in core.proxyEventsHub.attached() }
+        }
+    }
+
     private fun rowsChunk(columns: List<String>, rows: List<List<String?>>): ProxyRunMsg = proxyRunMsg {
         resultRows = runResultRows {
             this.columns += columns
@@ -316,7 +531,7 @@ class ApprovalExecuteRouteDbTest {
      */
     @Test
     fun `a second execute after a successful first is rejected with 409 approval_already_executed, storing exactly one result`() = testApplication {
-        val client = wire()
+        val client = wireAsExecutor()
         val roleR = "exec-once-role"
         val id = seedApprovedRoleRequest(roleR)
 
@@ -379,7 +594,7 @@ class ApprovalExecuteRouteDbTest {
      */
     @Test
     fun `execute returns 202 EXECUTING while the run is still in flight, then completes to EXECUTED and DONE`() = testApplication {
-        val client = wire()
+        val client = wireAsExecutor()
         val id = seedApprovedRoleRequest("exec-async-role")
 
         supervisorScope {
@@ -436,7 +651,7 @@ class ApprovalExecuteRouteDbTest {
 
     @Test
     fun `canceling an in-flight approval terminalizes both rows and emits RunCancel`() = testApplication {
-        val client = wire()
+        val client = wireAsExecutor()
         val id = seedApprovedRoleRequest("exec-cancel-role")
 
         supervisorScope {
@@ -479,7 +694,7 @@ class ApprovalExecuteRouteDbTest {
 
     @Test
     fun `V46 allows the requester to cancel and denies an unrelated principal without sending control`() = testApplication {
-        val client = wireAuthenticated()
+        val client = wire()
         val approver = "cancel-approver@example.com"
         val unrelated = "cancel-unrelated@example.com"
         for (principal in listOf(requester, approver, unrelated)) {
@@ -496,7 +711,7 @@ class ApprovalExecuteRouteDbTest {
                 ps.setLong(1, id); ps.executeUpdate()
             }
         }
-        assertNotNull(resultStore.startRun(id, approver))
+        assertNotNull(resultStore.startNextRun(id, approver))
 
         assertEquals(HttpStatusCode.NoContent, client.post("/test/session/$unrelated").status)
         val denied = client.post("/api/approvals/$id/cancel")
@@ -512,7 +727,7 @@ class ApprovalExecuteRouteDbTest {
 
     @Test
     fun `cancel is idempotent after execution and rejects pending tasks`() = testApplication {
-        val client = wire()
+        val client = wireAsExecutor()
         val executed = seedApprovedRoleRequest("exec-cancel-terminal-role")
         dataSource.connection.use { c ->
             c.prepareStatement("UPDATE access_request SET status = 'EXECUTED' WHERE id = ?").use { ps ->
@@ -537,7 +752,7 @@ class ApprovalExecuteRouteDbTest {
     /** The async task model exposes no /release or /withhold routes; hitting them 404s. */
     @Test
     fun `removed release and withhold routes return 404`() = testApplication {
-        val client = wire()
+        val client = wireAsExecutor()
         val id = seedApprovedRoleRequest("exec-removed-routes-role")
         assertEquals(HttpStatusCode.NotFound, client.post("/api/approvals/$id/release").status)
         assertEquals(HttpStatusCode.NotFound, client.post("/api/approvals/$id/withhold").status)
@@ -547,15 +762,15 @@ class ApprovalExecuteRouteDbTest {
      * The approver of record must be the one who executes (executedBy = decided_by = the approver). An
      * eligible approver B who did not approve THIS task cannot run a task approved by A: /execute rejects
      * with 403 `approval.not_the_approver` BEFORE the execute-once claim, so nothing runs and the task
-     * stays APPROVED. Under authDebug the R-scoped authority gate (`mayDecide`) short-circuits true, so this
-     * identity check — which has NO authDebug bypass — is the sole gate under test here. The positive case
+     * stays APPROVED. The fixture's blanket `task.approve` grant clears the R-scoped authority gate
+     * (`mayDecide`), so this identity check is the sole gate under test here. The positive case
      * (the approver of record executes and proceeds) is the default `decidedBy = executor` seed the other
      * tests above exercise.
      */
     @Test
     fun `execute by an approver other than the approver of record is 403 not_the_approver and runs nothing`() = testApplication {
-        val client = wire()
-        // Approved by a DIFFERENT approver A; the /execute caller is the authDebug principal debug-user (B).
+        val client = wireAsExecutor()
+        // Approved by a DIFFERENT approver A; the /execute caller is the signed-in executor (B).
         val id = seedApprovedRoleRequest("exec-wrong-approver-role", decidedBy = "approver-a@example.com")
 
         val denied = client.post("/api/approvals/$id/execute")
